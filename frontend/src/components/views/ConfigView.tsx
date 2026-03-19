@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react'
+import React, { useState, useCallback, useEffect, useRef } from 'react'
 import s from './ConfigView.module.css'
 
 const ALL_PAIRS = [
@@ -13,14 +13,6 @@ const FACTORS = [
 ]
 
 // ── Refresh interval options ──────────────────────────────────────────────────
-// Designed to stay within free-tier API limits:
-//   - Frankfurter (FX): no hard limit — safe at any interval
-//   - World Bank GDP: ~10 req/s, data changes quarterly — no concern
-//   - ECB: no hard limit — safe at any interval
-//   - FRED: 120 calls/min per key — safe even at 15 min interval
-//   - NewsAPI free: 100 requests/day → min safe interval = 100 / 8 currencies = 12.5 req/call → 12 calls/day max → ~2h
-//   - Alpha Vantage free: 25 req/day → 7 currencies per call → 3 full calls/day → min ~8h
-// The "Fastest" option is calibrated to NewsAPI (2h) as the tightest constraint.
 const REFRESH_OPTIONS: { label: string; value: number; note: string }[] = [
   { value: 7200,  label: 'Fastest (~2h)',  note: 'Min safe for NewsAPI free tier (100 req/day)' },
   { value: 900,   label: '15 min',         note: 'Good for FX + FRED only; skips news/AV on free tiers' },
@@ -32,11 +24,80 @@ const REFRESH_OPTIONS: { label: string; value: number; note: string }[] = [
   { value: 86400, label: 'Daily (24h)',    note: 'Lowest possible API usage — macro data rarely changes faster' },
 ]
 
-interface Props {
-  config: Record<string, any>
-  apiStatus: Record<string, string>
-  onSave: (cfg: Record<string, any>) => void
+// ── Per-source schedule info returned by /api/schedule ───────────────────────
+interface SourceInfo {
+  label:          string
+  nominal_s:      number
+  buffer_s:       number
+  requires_key:   boolean
+  note:           string
+  last_called_ts: number | null
+  call_count:     number
+  force_pending:  boolean
+  is_fresh:       boolean
+  age_s:          number | null
+  next_call_ts:   number
+  secs_until_due: number
+  next_call_hhmm: string
 }
+
+type ScheduleMap = Record<string, SourceInfo>
+
+// Source key → display order
+const SOURCE_ORDER = ['fx', 'cb_rates', 'gdp', 'fx_history', 'cpi', 'news', 'av']
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function fmtAge(age_s: number | null): string {
+  if (age_s === null) return '—'
+  if (age_s < 60)     return `${age_s}s ago`
+  if (age_s < 3600)   return `${Math.floor(age_s / 60)}m ago`
+  if (age_s < 86400)  return `${Math.floor(age_s / 3600)}h ago`
+  return `${Math.floor(age_s / 86400)}d ago`
+}
+
+function fmtCountdown(secs: number): string {
+  if (secs <= 0)     return 'NOW'
+  if (secs < 60)     return `${secs}s`
+  if (secs < 3600)   return `${Math.floor(secs / 60)}m ${secs % 60}s`
+  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`
+}
+
+function fmtNominal(s: number): string {
+  if (s < 60)     return `${s}s`
+  if (s < 3600)   return `${s / 60}m`
+  if (s < 86400)  return `${s / 3600}h`
+  return `${s / 86400}d`
+}
+
+function fmtTs(ts: number | null): string {
+  if (!ts) return '—'
+  try {
+    const d = new Date(ts * 1000)
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  } catch { return '—' }
+}
+
+const API_BASE = 'http://localhost:7700'
+
+async function triggerRefresh(source?: string): Promise<void> {
+  const url = source
+    ? `${API_BASE}/api/refresh?source=${encodeURIComponent(source)}`
+    : `${API_BASE}/api/refresh`
+  await fetch(url, { method: 'POST' }).catch(() => {})
+}
+
+async function fetchSchedule(): Promise<ScheduleMap | null> {
+  try {
+    const r = await fetch(`${API_BASE}/api/schedule`)
+    if (!r.ok) return null
+    return await r.json()
+  } catch {
+    return null
+  }
+}
+
+// ── Sub-components ────────────────────────────────────────────────────────────
 
 function Toggle({ value, onChange, label }: { value: boolean; onChange: (v: boolean) => void; label: string }) {
   return (
@@ -58,6 +119,199 @@ function ApiDot({ status }: { status?: string }) {
       {label}
     </span>
   )
+}
+
+// ── Refresh status table ──────────────────────────────────────────────────────
+
+function RefreshTable() {
+  const [schedule, setSchedule]       = useState<ScheduleMap | null>(null)
+  const [loading,  setLoading]        = useState(true)
+  const [refreshing, setRefreshing]   = useState<Record<string, boolean>>({})
+  const [ticks, setTicks]             = useState(0)  // force countdown re-render
+  const tickRef = useRef<ReturnType<typeof setInterval>>()
+
+  // Fetch schedule from backend
+  const loadSchedule = useCallback(async () => {
+    const data = await fetchSchedule()
+    if (data) setSchedule(data)
+    setLoading(false)
+  }, [])
+
+  useEffect(() => {
+    loadSchedule()
+    // Poll every 10 s for schedule updates
+    const pollInterval = setInterval(loadSchedule, 10_000)
+    // Tick every second for countdown display
+    tickRef.current = setInterval(() => setTicks(t => t + 1), 1000)
+    return () => {
+      clearInterval(pollInterval)
+      if (tickRef.current) clearInterval(tickRef.current)
+    }
+  }, [loadSchedule])
+
+  const handleRefreshSource = async (key: string) => {
+    setRefreshing(prev => ({ ...prev, [key]: true }))
+    await triggerRefresh(key)
+    await loadSchedule()
+    setTimeout(() => {
+      setRefreshing(prev => ({ ...prev, [key]: false }))
+      loadSchedule()
+    }, 2500)
+  }
+
+  const handleRefreshAll = async () => {
+    const keys = SOURCE_ORDER
+    const next: Record<string, boolean> = {}
+    keys.forEach(k => { next[k] = true })
+    setRefreshing(next)
+    await triggerRefresh()
+    await loadSchedule()
+    setTimeout(() => {
+      const cleared: Record<string, boolean> = {}
+      keys.forEach(k => { cleared[k] = false })
+      setRefreshing(cleared)
+      loadSchedule()
+    }, 3000)
+  }
+
+  if (loading) {
+    return (
+      <div style={{ padding: '20px', textAlign: 'center', color: 'var(--text-faint)', fontSize: '10px' }}>
+        Loading schedule…
+      </div>
+    )
+  }
+
+  if (!schedule) {
+    return (
+      <div style={{ padding: '12px', background: 'rgba(255,80,80,0.06)', border: '1px solid rgba(255,80,80,0.2)', borderRadius: 4, fontSize: '9px', color: 'var(--red)' }}>
+        ⚠ Backend not reachable — schedule unavailable. Ensure the backend is running on port 7700.
+      </div>
+    )
+  }
+
+  // Compute live countdowns by adding seconds since last paint
+  const now = Math.floor(Date.now() / 1000)
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {/* Header row */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span style={{ fontSize: '9px', color: 'var(--text-faint)', letterSpacing: '0.04em' }}>
+          Auto-polls every 10 s · Countdown is live
+        </span>
+        <button
+          className={s.btnRefreshAll}
+          onClick={handleRefreshAll}
+          disabled={Object.values(refreshing).some(Boolean)}
+        >
+          ↺ Refresh All
+        </button>
+      </div>
+
+      {/* Table */}
+      <div className={s.scheduleTable}>
+        {/* Column headers */}
+        <div className={s.scheduleHead}>
+          <span>Source</span>
+          <span>Status</span>
+          <span>Last Fetched</span>
+          <span>Next In</span>
+          <span>Next At</span>
+          <span>Interval</span>
+          <span>Calls</span>
+          <span></span>
+        </div>
+
+        {SOURCE_ORDER.map(key => {
+          const info = schedule[key]
+          if (!info) return null
+
+          const liveSecs = Math.max(0, info.next_call_ts - now)
+          const isRefreshing = !!refreshing[key]
+
+          // Freshness status
+          let statusLabel = 'NEVER'
+          let statusCls   = s.statusNever
+          if (info.force_pending) {
+            statusLabel = 'PENDING'
+            statusCls   = s.statusPending
+          } else if (info.is_fresh) {
+            statusLabel = 'FRESH'
+            statusCls   = s.statusFresh
+          } else if (info.last_called_ts) {
+            statusLabel = 'STALE'
+            statusCls   = s.statusStale
+          }
+
+          return (
+            <div key={key} className={`${s.scheduleRow} ${info.requires_key ? s.scheduleRowKeyed : ''}`}>
+              <span className={s.scheduleLabel}>
+                {info.requires_key && <span className={s.keyBadge}>KEY</span>}
+                {info.label}
+                <span className={s.scheduleNote}>{info.note}</span>
+              </span>
+
+              <span className={`${s.statusBadge} ${statusCls}`}>
+                {statusLabel}
+              </span>
+
+              <span className={s.scheduleCell} style={{ fontFamily: 'var(--font-mono)' }}>
+                {fmtTs(info.last_called_ts)}
+                {info.age_s !== null && (
+                  <span style={{ display: 'block', fontSize: '8px', color: 'var(--text-faint)', marginTop: 1 }}>
+                    {fmtAge(info.age_s)}
+                  </span>
+                )}
+              </span>
+
+              <span
+                className={s.scheduleCell}
+                style={{
+                  fontFamily: 'var(--font-mono)',
+                  color: liveSecs === 0 ? 'var(--yellow)' : 'var(--text-primary)',
+                  fontWeight: liveSecs === 0 ? 700 : 400,
+                }}
+              >
+                {fmtCountdown(liveSecs)}
+              </span>
+
+              <span className={s.scheduleCell} style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>
+                {info.next_call_hhmm}
+              </span>
+
+              <span className={s.scheduleCell} style={{ color: 'var(--text-faint)' }}>
+                {fmtNominal(info.nominal_s)}
+              </span>
+
+              <span className={s.scheduleCell} style={{ color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                {info.call_count}
+              </span>
+
+              <span style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                <button
+                  className={`${s.btnRefreshRow} ${isRefreshing ? s.btnRefreshing : ''}`}
+                  onClick={() => handleRefreshSource(key)}
+                  disabled={isRefreshing}
+                  title={`Force-refresh ${info.label}`}
+                >
+                  {isRefreshing ? '…' : '↺'}
+                </button>
+              </span>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
+
+interface Props {
+  config: Record<string, any>
+  apiStatus: Record<string, string>
+  onSave: (cfg: Record<string, any>) => void
 }
 
 export default function ConfigView({ config, apiStatus, onSave }: Props) {
@@ -216,60 +470,74 @@ export default function ConfigView({ config, apiStatus, onSave }: Props) {
 
       {/* ── Tab: Refresh Rate ─────────────────────────────────────────── */}
       {activeTab === 'refresh' && (
-        <div className={s.section}>
-          <div className={s.sectionHeader}>
-            <span className={s.sectionIcon}>⏱</span>
-            <span className={s.sectionTitle}>Refresh Interval</span>
-          </div>
-          <div className={s.sectionBody}>
-            <p style={{ fontSize: '9px', color: 'var(--text-secondary)', marginBottom: 14, maxWidth: 560, lineHeight: 1.6 }}>
-              Controls how often the backend fetches new data from all APIs.
-              The limiting factor is typically <strong style={{ color: 'var(--yellow)' }}>NewsAPI</strong> (100 req/day free)
-              and <strong style={{ color: 'var(--yellow)' }}>Alpha Vantage</strong> (25 req/day free).
-              Shorter intervals will exhaust your free quota if you have those keys configured.
-              FX rates and GDP/ECB have no meaningful rate limits.
-            </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              {REFRESH_OPTIONS.map(opt => {
-                const isSelected = currentInterval === opt.value
-                return (
-                  <div
-                    key={opt.value}
-                    onClick={() => set('refresh_interval_s', opt.value)}
-                    style={{
-                      display: 'flex', alignItems: 'center', gap: 12,
-                      padding: '8px 12px',
-                      background: isSelected ? 'rgba(122,162,247,0.1)' : 'var(--surface)',
-                      border: `1px solid ${isSelected ? 'rgba(122,162,247,0.4)' : 'var(--border)'}`,
-                      borderRadius: 4, cursor: 'pointer',
-                      transition: 'all 0.15s',
-                    }}
-                  >
-                    <div style={{
-                      width: 12, height: 12, borderRadius: '50%',
-                      background: isSelected ? 'var(--accent)' : 'transparent',
-                      border: `2px solid ${isSelected ? 'var(--accent)' : 'var(--border)'}`,
-                      flexShrink: 0,
-                      transition: 'all 0.15s',
-                    }} />
-                    <span style={{ fontWeight: 700, fontSize: '10px', color: isSelected ? 'var(--accent)' : 'var(--text-primary)', minWidth: 100 }}>
-                      {opt.label}
-                    </span>
-                    <span style={{ fontSize: '9px', color: 'var(--text-secondary)' }}>
-                      {opt.note}
-                    </span>
-                  </div>
-                )
-              })}
+          {/* ── Section 1: Interval selector ───────────────────────── */}
+          <div className={s.section}>
+            <div className={s.sectionHeader}>
+              <span className={s.sectionIcon}>⏱</span>
+              <span className={s.sectionTitle}>Auto-Refresh Interval</span>
             </div>
+            <div className={s.sectionBody}>
+              <p style={{ fontSize: '9px', color: 'var(--text-secondary)', marginBottom: 4, maxWidth: 560, lineHeight: 1.6 }}>
+                Controls how often the backend fetches new data from all APIs.
+                The limiting factor is <strong style={{ color: 'var(--yellow)' }}>NewsAPI</strong> (100 req/day free)
+                and <strong style={{ color: 'var(--yellow)' }}>Alpha Vantage</strong> (25 req/day free).
+                FX rates and GDP/ECB have no meaningful rate limits.
+              </p>
 
-            {currentOption && (
-              <div style={{ marginTop: 14, padding: '8px 12px', background: 'rgba(122,162,247,0.05)', border: '1px solid rgba(122,162,247,0.2)', borderRadius: 4, fontSize: '9px', color: 'var(--text-secondary)' }}>
-                <strong style={{ color: 'var(--accent)' }}>Current:</strong> {currentOption.label} — refreshes every {currentOption.value >= 3600 ? `${currentOption.value/3600}h` : `${currentOption.value/60}min`}.
-                {' '}{currentOption.note}.
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {REFRESH_OPTIONS.map(opt => {
+                  const isSelected = currentInterval === opt.value
+                  return (
+                    <div
+                      key={opt.value}
+                      onClick={() => set('refresh_interval_s', opt.value)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 12,
+                        padding: '8px 12px',
+                        background: isSelected ? 'rgba(122,162,247,0.1)' : 'var(--bg-secondary)',
+                        border: `1px solid ${isSelected ? 'rgba(122,162,247,0.4)' : 'var(--border)'}`,
+                        borderRadius: 4, cursor: 'pointer',
+                        transition: 'all 0.15s',
+                      }}
+                    >
+                      <div style={{
+                        width: 12, height: 12, borderRadius: '50%',
+                        background: isSelected ? 'var(--accent)' : 'transparent',
+                        border: `2px solid ${isSelected ? 'var(--accent)' : 'var(--border)'}`,
+                        flexShrink: 0,
+                        transition: 'all 0.15s',
+                      }} />
+                      <span style={{ fontWeight: 700, fontSize: '10px', color: isSelected ? 'var(--accent)' : 'var(--text-primary)', minWidth: 100 }}>
+                        {opt.label}
+                      </span>
+                      <span style={{ fontSize: '9px', color: 'var(--text-secondary)' }}>
+                        {opt.note}
+                      </span>
+                    </div>
+                  )
+                })}
               </div>
-            )}
+
+              {currentOption && (
+                <div style={{ marginTop: 8, padding: '8px 12px', background: 'rgba(122,162,247,0.05)', border: '1px solid rgba(122,162,247,0.2)', borderRadius: 4, fontSize: '9px', color: 'var(--text-secondary)' }}>
+                  <strong style={{ color: 'var(--accent)' }}>Selected:</strong> {currentOption.label} — refreshes every {currentOption.value >= 3600 ? `${currentOption.value/3600}h` : `${currentOption.value/60}min`}.
+                  {' '}{currentOption.note}.
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* ── Section 2: Live status table ────────────────────────── */}
+          <div className={s.section}>
+            <div className={s.sectionHeader}>
+              <span className={s.sectionIcon}>📡</span>
+              <span className={s.sectionTitle}>Live Source Status</span>
+            </div>
+            <div className={s.sectionBody}>
+              <RefreshTable />
+            </div>
           </div>
         </div>
       )}
