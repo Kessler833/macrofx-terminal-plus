@@ -1,8 +1,11 @@
 import styles from './TitleBar.module.css'
 
-interface Props { connected: boolean }
+interface Props {
+  connected: boolean
+  onRefresh: () => void
+}
 
-export default function TitleBar({ connected }: Props) {
+export default function TitleBar({ connected, onRefresh }: Props) {
   const minimize = () => (window as any).electronAPI?.minimize()
   const maximize = () => (window as any).electronAPI?.maximize()
   const close    = () => (window as any).electronAPI?.close()
@@ -18,6 +21,7 @@ export default function TitleBar({ connected }: Props) {
       <div className={styles.right}>
         <span className={`${styles.dot} ${connected ? styles.dotOn : styles.dotOff}`} />
         <span className={styles.connLabel}>{connected ? 'LIVE' : 'OFFLINE'}</span>
+        <button className={styles.wc} onClick={onRefresh} title="Force refresh">⟳</button>
         <button className={styles.wc} onClick={minimize}>─</button>
         <button className={styles.wc} onClick={maximize}>□</button>
         <button className={`${styles.wc} ${styles.close}`} onClick={close}>✕</button>
