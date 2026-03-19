@@ -14,9 +14,42 @@ PAIRS_DEFAULT = [
     "AUDNZD","EURJPY","CADJPY","CHFJPY","EURCHF",
 ]
 
-# NO static fallback data anywhere in this file.
-# If a fetch fails the cache stays empty and the frontend shows the error.
-# All error details are surfaced to the frontend via api_errors.
+# ── FRED series IDs per currency ──────────────────────────────────────────────
+# CPI series: MoM change in consumer prices (or closest available)
+# Rate series: overnight/policy rate
+FRED_CPI_SERIES: Dict[str, str] = {
+    "USD": "CPIAUCSL",      # US CPI All Urban Consumers
+    "EUR": "CP0000EZ19M086NEST",  # Euro area HICP
+    "GBP": "GBRCPIALLMINMEI",    # UK CPI all items
+    "JPY": "JPNCPIALLMINMEI",    # Japan CPI all items
+    "AUD": "AUSCPIALLQINMEI",    # Australia CPI (quarterly — FRED best available)
+    "NZD": "NZLCPIALLQINMEI",    # New Zealand CPI (quarterly)
+    "CAD": "CPALCY01CAM661N",    # Canada CPI
+    "CHF": "CHECPIALLMINMEI",    # Switzerland CPI
+}
+
+FRED_RATE_SERIES: Dict[str, str] = {
+    "USD": "FEDFUNDS",           # US Federal Funds Rate
+    "GBP": "IUDSOIA",           # Bank Rate (BoE) — FRED code
+    "JPY": "IRSTCB01JPM156N",   # Japan call rate / BoJ policy
+    "AUD": "IRSTCB01AUM156N",   # RBA cash rate
+    "NZD": "IRSTCB01NZM156N",   # RBNZ OCR
+    "CAD": "IRSTCB01CAM156N",   # BoC overnight rate
+    "CHF": "IRSTCB01CHM156N",   # SNB policy rate
+    # EUR is fetched directly from ECB — not FRED
+}
+
+# Bank labels and hawkish/dovish thresholds
+CB_META_STATIC: Dict[str, dict] = {
+    "USD": {"bank": "Federal Reserve",  "hawk_above": 4.0,  "dove_below": 2.0},
+    "EUR": {"bank": "ECB",              "hawk_above": 2.5,  "dove_below": 1.5},
+    "GBP": {"bank": "Bank of England",  "hawk_above": 4.0,  "dove_below": 2.0},
+    "JPY": {"bank": "Bank of Japan",    "hawk_above": 0.5,  "dove_below": 0.0},
+    "AUD": {"bank": "RBA",              "hawk_above": 3.5,  "dove_below": 2.0},
+    "NZD": {"bank": "RBNZ",             "hawk_above": 3.5,  "dove_below": 2.0},
+    "CAD": {"bank": "Bank of Canada",   "hawk_above": 3.5,  "dove_below": 2.0},
+    "CHF": {"bank": "SNB",              "hawk_above": 1.0,  "dove_below": 0.0},
+}
 
 
 class DataFetcher:
@@ -24,7 +57,6 @@ class DataFetcher:
         self.cfg = cfg
         self._client: Optional[httpx.AsyncClient] = None
 
-        # ── Data caches — empty until a successful live fetch ─────────────
         self.fx_rates:    Dict[str, float] = {}
         self.fx_history:  Dict[str, Dict[str, float]] = {}
         self.cb_rates:    Dict[str, float] = {}
@@ -33,9 +65,6 @@ class DataFetcher:
         self.cpi_changes: Dict[str, float] = {}
         self.news_scores: Dict[str, int]   = {}
 
-        # ── Source tagging ────────────────────────────────────────────────
-        # Values: "live" | "error" | "no_key" | "pending"
-        # NOTE: "static" is intentionally removed — there are no silent fallbacks.
         self.data_sources: Dict[str, str] = {
             "cb_rates": "pending",
             "gdp":      "pending",
@@ -45,7 +74,6 @@ class DataFetcher:
             "av":       "pending",
         }
 
-        # ── API connection status (shown as dots in Config) ───────────────
         self.api_status: Dict[str, str] = {
             "fx":        "pending",
             "fred":      "pending",
@@ -55,13 +83,8 @@ class DataFetcher:
             "ecb":       "pending",
         }
 
-        # ── Detailed error log — surfaced to the frontend ─────────────────
-        # Keyed by data group. Each value: {error, error_type, http_code, ts}
-        # error_type: "HTTP_ERROR" | "TIMEOUT" | "PARSE_ERROR" | "NO_KEY"
-        #             | "RATE_LIMIT" | "NETWORK" | "EMPTY_RESPONSE"
         self.api_errors: Dict[str, Any] = {}
 
-        # ── Staleness timestamps (unix ts of last successful fetch) ────────
         self.fetch_ts: Dict[str, float] = {
             "cb_rates": 0, "gdp": 0, "cpi": 0,
             "fx": 0, "news": 0, "av": 0,
@@ -70,7 +93,7 @@ class DataFetcher:
     @property
     def client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+            self._client = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
         return self._client
 
     async def close(self):
@@ -78,7 +101,6 @@ class DataFetcher:
             await self._client.aclose()
 
     def _record_error(self, group: str, exc: Exception, http_code: Optional[int] = None):
-        """Classify and store an error for the given data group."""
         msg = str(exc)
         if http_code == 429:
             etype = "RATE_LIMIT"
@@ -101,7 +123,6 @@ class DataFetcher:
         logger.warning("[%s] %s: %s", group, etype, msg[:120])
 
     def get_data_provenance(self) -> Dict[str, dict]:
-        """Return provenance for every data group: source + age_seconds + error details."""
         now = time.time()
         result = {}
         for key, src in self.data_sources.items():
@@ -110,11 +131,11 @@ class DataFetcher:
             result[key] = {
                 "source": src,
                 "age_s":  int(now - ts) if ts > 0 else None,
-                "error":  err,  # None when healthy
+                "error":  err,
             }
         return result
 
-    # ── FX Rates (no auth — frankfurter.app / open.er-api.com) ───────────
+    # ── FX Rates ──────────────────────────────────────────────────────────
     async def fetch_fx_rates(self) -> bool:
         urls = [
             "https://api.frankfurter.app/latest?base=USD",
@@ -130,7 +151,7 @@ class DataFetcher:
                 data  = r.json()
                 rates = data.get("rates") or data.get("conversion_rates", {})
                 if not rates:
-                    raise ValueError("Empty rates object in response")
+                    raise ValueError("Empty rates object")
                 new_rates: Dict[str, float] = {}
                 for pair in PAIRS_DEFAULT:
                     b, q = pair[:3], pair[3:]
@@ -139,7 +160,7 @@ class DataFetcher:
                     if rb and rq:
                         new_rates[pair] = round(rq / rb, 5)
                 if not new_rates:
-                    raise ValueError("No valid pairs computed from rates")
+                    raise ValueError("No valid pairs computed")
                 self.fx_rates            = new_rates
                 self.api_status["fx"]    = "ok"
                 self.data_sources["fx"]  = "live"
@@ -148,15 +169,14 @@ class DataFetcher:
                 return True
             except Exception as e:
                 last_exc  = e
-                last_code = getattr(e, 'response', None) and e.response.status_code  # type: ignore
-        # Both URLs failed
+                last_code = getattr(getattr(e, 'response', None), 'status_code', None)
         self.api_status["fx"]   = "error"
         self.data_sources["fx"] = "error"
         if last_exc:
             self._record_error("fx", last_exc, last_code)
         return False
 
-    # ── FX History (for correlation matrix) ──────────────────────────────
+    # ── FX History ────────────────────────────────────────────────────────
     async def fetch_fx_history(self) -> bool:
         end   = date.today()
         start = end - timedelta(days=92)
@@ -167,7 +187,7 @@ class DataFetcher:
             r.raise_for_status()
             data = r.json().get("rates", {})
             if not data:
-                raise ValueError("Empty history response")
+                raise ValueError("Empty history")
             self.fx_history = data
             return True
         except Exception as e:
@@ -175,7 +195,7 @@ class DataFetcher:
                 getattr(getattr(e, 'response', None), 'status_code', None))
             return False
 
-    # ── ECB Deposit Rate (free, no key) ──────────────────────────────────
+    # ── ECB Deposit Rate (free, no key) ───────────────────────────────────
     async def fetch_ecb_rate(self) -> bool:
         url = ("https://data-api.ecb.europa.eu/service/data/FM/"
                "B.U2.EUR.4F.KR.DFR.LEV?lastNObservations=2&format=json")
@@ -190,16 +210,7 @@ class DataFetcher:
                 raise ValueError("ECB: empty observations")
             latest_key = max(obs.keys(), key=int)
             val = float(obs[latest_key][0])
-            self.cb_rates["EUR"] = val
-            if "EUR" not in self.cb_meta:
-                self.cb_meta["EUR"] = {}
-            self.cb_meta["EUR"].update({
-                "bank":   "ECB",
-                "rate":   val,
-                "stance": "Hawkish" if val > 2.5 else "Dovish" if val < 1.5 else "Neutral",
-                "next":   "—",
-                "change": 0,
-            })
+            self._store_cb_rate("EUR", val)
             self.api_status["ecb"]       = "ok"
             self.data_sources["cb_rates"] = "live"
             self.fetch_ts["cb_rates"]     = time.time()
@@ -211,13 +222,27 @@ class DataFetcher:
                 getattr(getattr(e, 'response', None), 'status_code', None))
             return False
 
-    # ── World Bank GDP (free, no key) ─────────────────────────────────────
+    def _store_cb_rate(self, cur: str, val: float) -> None:
+        """Store a CB rate and update meta."""
+        self.cb_rates[cur] = round(val, 3)
+        meta = CB_META_STATIC.get(cur, {})
+        self.cb_meta[cur] = {
+            "bank":   meta.get("bank", cur),
+            "rate":   round(val, 3),
+            "stance": ("Hawkish" if val > meta.get("hawk_above", 3.0)
+                       else "Dovish" if val < meta.get("dove_below", 1.0)
+                       else "Neutral"),
+            "next":   "—",
+            "change": 0,
+        }
+
+    # ── World Bank GDP ────────────────────────────────────────────────────
     async def fetch_gdp(self) -> bool:
         wb_map = {
             "EUR": "EMU", "GBP": "GBR", "JPY": "JPN",
             "AUD": "AUS", "NZD": "NZL", "CAD": "CAN", "CHF": "CHE",
         }
-        ok = False
+        ok     = False
         errors: list = []
 
         async def _fetch_one(cur: str, iso: str):
@@ -229,10 +254,10 @@ class DataFetcher:
                 r.raise_for_status()
                 payload = r.json()
                 if not payload or len(payload) < 2:
-                    raise ValueError(f"WB GDP {cur}: malformed response")
+                    raise ValueError(f"WB GDP {cur}: malformed")
                 obs = [x for x in (payload[1] or []) if x.get("value") is not None]
                 if not obs:
-                    raise ValueError(f"WB GDP {cur}: no valid observations")
+                    raise ValueError(f"WB GDP {cur}: no data")
                 self.gdp_vals[cur] = round(obs[0]["value"], 2)
                 ok = True
             except Exception as e:
@@ -249,14 +274,14 @@ class DataFetcher:
             self.api_status["worldbank"] = "error"
             self.data_sources["gdp"]     = "error"
             self.api_errors["gdp"] = {
-                "error":      "All World Bank GDP requests failed: " + ", ".join(errors),
-                "error_type": "HTTP_ERROR" if errors else "NETWORK",
+                "error":      "All WB GDP requests failed: " + ", ".join(errors),
+                "error_type": "HTTP_ERROR",
                 "http_code":  None,
                 "ts":         int(time.time()),
             }
         return ok
 
-    # ── FRED (requires user API key) ──────────────────────────────────────
+    # ── FRED: CPI + CB rates for all currencies ───────────────────────────
     async def fetch_fred(self) -> bool:
         key = self.cfg.get("fred_api_key", "").strip()
         if not key:
@@ -269,70 +294,100 @@ class DataFetcher:
                 "ts":         int(time.time()),
             }
             return False
-        base = "https://api.stlouisfed.org/fred/series/observations"
 
-        async def _series(series_id: str):
-            url = (f"{base}?series_id={series_id}&api_key={key}"
-                   f"&file_type=json&limit=3&sort_order=desc")
+        base_url = "https://api.stlouisfed.org/fred/series/observations"
+
+        async def _series(series_id: str, label: str):
+            url = (f"{base_url}?series_id={series_id}&api_key={key}"
+                   f"&file_type=json&limit=4&sort_order=desc")
             try:
                 r = await self.client.get(url)
                 if r.status_code == 429:
-                    raise httpx.HTTPStatusError("FRED rate limit", request=r.request, response=r)
+                    raise httpx.HTTPStatusError("FRED rate limit",
+                        request=r.request, response=r)
                 r.raise_for_status()
-                obs = [o for o in r.json().get("observations", []) if o["value"] != "."]
+                obs = [o for o in r.json().get("observations", [])
+                       if o.get("value", ".") != "."]
                 if len(obs) < 2:
-                    raise ValueError(f"FRED {series_id}: insufficient observations ({len(obs)})")
-                return {"cur": float(obs[0]["value"]), "prev": float(obs[1]["value"])}
+                    raise ValueError(
+                        f"FRED {series_id}: only {len(obs)} obs (need 2)")
+                return {
+                    "cur":  float(obs[0]["value"]),
+                    "prev": float(obs[1]["value"]),
+                }
             except Exception as e:
                 code = getattr(getattr(e, 'response', None), 'status_code', None)
-                self._record_error(f"fred_{series_id}", e, code)
+                logger.warning("[FRED %s/%s] %s", label, series_id, e)
                 return None
 
-        tasks_def = [
-            ("CPIAUCSL",        "usd_cpi"),
-            ("FEDFUNDS",         "fed_funds"),
-            ("A191RL1Q225SBEA",  "usd_gdp"),
-        ]
-        results = await asyncio.gather(*[_series(s) for s, _ in tasks_def])
-        ok = False
-        for (sid, key_name), res in zip(tasks_def, results):
+        # Build task list: (currency, type, series_id)
+        tasks: list[tuple[str, str, str]] = []
+        for cur, sid in FRED_CPI_SERIES.items():
+            tasks.append((cur, "cpi", sid))
+        for cur, sid in FRED_RATE_SERIES.items():
+            tasks.append((cur, "rate", sid))
+        # Also fetch USD GDP from FRED
+        tasks.append(("USD", "gdp", "A191RL1Q225SBEA"))
+
+        results = await asyncio.gather(
+            *[_series(sid, f"{cur}/{typ}") for cur, typ, sid in tasks]
+        )
+
+        any_ok   = False
+        cpi_ok   = False
+        rates_ok = False
+
+        for (cur, typ, sid), res in zip(tasks, results):
             if res is None:
                 continue
-            ok = True
+            any_ok = True
             change = res["cur"] - res["prev"]
-            if key_name == "usd_cpi":
-                self.cpi_changes["USD"]   = round(change, 3)
-                self.data_sources["cpi"] = "live"
-                self.fetch_ts["cpi"]     = time.time()
-                self.api_errors.pop("cpi", None)
-            elif key_name == "fed_funds":
-                self.cb_rates["USD"] = round(res["cur"], 3)
-                if "USD" not in self.cb_meta:
-                    self.cb_meta["USD"] = {}
-                self.cb_meta["USD"].update({
-                    "bank":   "Federal Reserve",
-                    "rate":   round(res["cur"], 3),
-                    "stance": "Hawkish" if res["cur"] > 4 else "Dovish" if res["cur"] < 2 else "Neutral",
-                    "next":   "—",
-                    "change": round(change, 3),
-                })
-                self.data_sources["cb_rates"] = "live"
-                self.fetch_ts["cb_rates"]      = time.time()
-            elif key_name == "usd_gdp":
-                self.gdp_vals["USD"] = round(res["cur"], 2)
-                self.data_sources["gdp"] = "live"
 
-        self.api_status["fred"] = "ok" if ok else "error"
-        if not ok:
+            if typ == "cpi":
+                self.cpi_changes[cur] = round(change, 4)
+                cpi_ok = True
+
+            elif typ == "rate":
+                self._store_cb_rate(cur, res["cur"])
+                # Patch change into meta
+                if cur in self.cb_meta:
+                    self.cb_meta[cur]["change"] = round(change, 3)
+                rates_ok = True
+
+            elif typ == "gdp" and cur == "USD":
+                self.gdp_vals["USD"] = round(res["cur"], 2)
+
+        self.api_status["fred"] = "ok" if any_ok else "error"
+
+        if cpi_ok:
+            self.data_sources["cpi"] = "live"
+            self.fetch_ts["cpi"]     = time.time()
+            self.api_errors.pop("cpi", None)
+        else:
+            self.data_sources["cpi"] = "error"
+            self.api_errors["cpi"] = {
+                "error":      "FRED CPI fetch failed for all currencies",
+                "error_type": "HTTP_ERROR",
+                "http_code":  None,
+                "ts":         int(time.time()),
+            }
+
+        if rates_ok:
+            self.data_sources["cb_rates"] = "live"
+            self.fetch_ts["cb_rates"]      = time.time()
+            self.api_errors.pop("cb_rates", None)
+
+        if not any_ok:
             self.api_errors["cpi"] = {
                 "error":      "FRED returned no usable data (check key validity)",
                 "error_type": "HTTP_ERROR",
                 "http_code":  None,
                 "ts":         int(time.time()),
             }
-        return ok
 
-    # ── News sentiment (requires NewsAPI key) ─────────────────────────────
+        return any_ok
+
+    # ── News sentiment ────────────────────────────────────────────────────
     async def fetch_news_sentiment(self) -> bool:
         key = self.cfg.get("news_api_key", "").strip()
         if not key:
@@ -355,8 +410,10 @@ class DataFetcher:
             "CAD": "Canadian dollar Bank of Canada oil",
             "CHF": "Swiss franc SNB safe haven",
         }
-        POS = {"surge","rise","strong","growth","beat","bullish","hawkish","gain","high","positive","increase","expand","rally","jump"}
-        NEG = {"fall","drop","weak","recession","miss","bearish","dovish","loss","cut","decline","contract","concern","slump","slide"}
+        POS = {"surge","rise","strong","growth","beat","bullish","hawkish",
+               "gain","high","positive","increase","expand","rally","jump"}
+        NEG = {"fall","drop","weak","recession","miss","bearish","dovish",
+               "loss","cut","decline","contract","concern","slump","slide"}
         ok = False
         any_error: Optional[str] = None
         for cur, q in queries.items():
@@ -365,7 +422,7 @@ class DataFetcher:
             try:
                 r = await self.client.get(url)
                 if r.status_code == 429:
-                    any_error = "NewsAPI rate limit reached"
+                    any_error = "NewsAPI rate limit"
                     break
                 r.raise_for_status()
                 data = r.json()
@@ -374,7 +431,8 @@ class DataFetcher:
                     continue
                 score = 0
                 for art in data.get("articles", []):
-                    text = ((art.get("title") or "") + " " + (art.get("description") or "")).lower()
+                    text = ((art.get("title") or "") + " " +
+                            (art.get("description") or "")).lower()
                     for w in POS:
                         if w in text: score += 1
                     for w in NEG:
@@ -383,7 +441,6 @@ class DataFetcher:
                 ok = True
                 await asyncio.sleep(0.15)
             except Exception as e:
-                code = getattr(getattr(e, 'response', None), 'status_code', None)
                 any_error = f"{type(e).__name__}: {str(e)[:80]}"
                 logger.warning("[NEWS %s] %s", cur, any_error)
         if ok:
@@ -396,13 +453,13 @@ class DataFetcher:
             self.data_sources["news"] = "error"
             self.api_errors["news"] = {
                 "error":      any_error or "NewsAPI: all requests failed",
-                "error_type": "RATE_LIMIT" if any_error and "rate limit" in (any_error or "").lower() else "HTTP_ERROR",
+                "error_type": "RATE_LIMIT" if "rate limit" in (any_error or "").lower() else "HTTP_ERROR",
                 "http_code":  None,
                 "ts":         int(time.time()),
             }
         return ok
 
-    # ── Alpha Vantage FX trend (requires AV key) ──────────────────────────
+    # ── Alpha Vantage FX trend ────────────────────────────────────────────
     async def fetch_av_trends(self, trend_overrides: dict) -> bool:
         key = self.cfg.get("alpha_vantage_key", "").strip()
         if not key:
@@ -415,8 +472,8 @@ class DataFetcher:
                 "ts":         int(time.time()),
             }
             return False
-        targets = ["EUR","GBP","JPY","AUD","NZD","CAD","CHF"]
-        ok = False
+        targets      = ["EUR","GBP","JPY","AUD","NZD","CAD","CHF"]
+        ok           = False
         rate_limited = False
         for cur in targets:
             if rate_limited:
@@ -438,22 +495,21 @@ class DataFetcher:
                     break
                 series = data.get("Weekly Time Series Forex (FX)", {})
                 if not series:
-                    raise ValueError(f"AV {cur}: no series data in response")
-                dates  = sorted(series.keys(), reverse=True)
+                    raise ValueError(f"AV {cur}: no series")
+                dates = sorted(series.keys(), reverse=True)
                 if len(dates) < 20:
-                    raise ValueError(f"AV {cur}: only {len(dates)} weekly bars, need 20")
-                price  = float(series[dates[0]]["4. close"])
-                ma8    = sum(float(series[d]["4. close"]) for d in dates[:8])  / 8
-                ma20   = sum(float(series[d]["4. close"]) for d in dates[:20]) / 20
+                    raise ValueError(f"AV {cur}: only {len(dates)} bars")
+                price = float(series[dates[0]]["4. close"])
+                ma8   = sum(float(series[d]["4. close"]) for d in dates[:8])  / 8
+                ma20  = sum(float(series[d]["4. close"]) for d in dates[:20]) / 20
                 trend_overrides[cur] = (
                     2 if price > ma8 > ma20  else
                     1 if price > ma8         else
                    -2 if price < ma8 < ma20  else -1
                 )
                 ok = True
-                await asyncio.sleep(1.2)  # AV free tier: 5 calls/min
+                await asyncio.sleep(1.2)
             except Exception as e:
-                code = getattr(getattr(e, 'response', None), 'status_code', None)
                 logger.warning("[AV %s] %s", cur, e)
         if ok:
             self.api_status["av"]   = "ok"
@@ -466,14 +522,14 @@ class DataFetcher:
             self.data_sources["av"] = "error"
             if "av" not in self.api_errors:
                 self.api_errors["av"] = {
-                    "error":      "Alpha Vantage: all currency requests failed",
+                    "error":      "Alpha Vantage: all requests failed",
                     "error_type": "HTTP_ERROR",
                     "http_code":  None,
                     "ts":         int(time.time()),
                 }
         return ok
 
-    # ── Correlation matrix (computed from fx_history cache) ───────────────
+    # ── Correlation matrix ────────────────────────────────────────────────
     def compute_correlation_matrix(self) -> Dict[str, Dict[str, float]]:
         import math
         curs  = ["USD","EUR","GBP","JPY","AUD","NZD","CAD","CHF"]
@@ -507,7 +563,7 @@ class DataFetcher:
                 matrix[a][b] = 1.0 if a == b else pearson(series.get(a,[]), series.get(b,[]))
         return matrix
 
-    # ── Full refresh cycle ────────────────────────────────────────────────
+    # ── Full refresh ──────────────────────────────────────────────────────
     async def refresh_all(self, trend_overrides: dict) -> None:
         await asyncio.gather(
             self.fetch_fx_rates(),
