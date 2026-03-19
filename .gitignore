@@ -1,0 +1,12 @@
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist-electron/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+config.json
+*.log
+.DS_Store

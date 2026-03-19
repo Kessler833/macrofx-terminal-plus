@@ -1,0 +1,44 @@
+.sidebar {
+  width: 160px;
+  min-width: 160px;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.nav { display: flex; flex-direction: column; padding: 8px 0; }
+.navItem {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px;
+  background: none; border: none;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10px; font-weight: 700;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+  position: relative;
+  transition: color 0.15s, background 0.15s;
+  text-align: left;
+}
+.navItem:hover { color: var(--text-primary); background: var(--bg-hover); }
+.active { color: var(--text-primary) !important; background: var(--bg-hover) !important; }
+.indicator {
+  position: absolute;
+  left: 0; top: 4px; bottom: 4px;
+  width: 3px;
+  background: var(--accent);
+  border-radius: 0 2px 2px 0;
+}
+.icon  { font-size: 13px; width: 16px; text-align: center; }
+.label { font-size: 9px; letter-spacing: 0.12em; }
+
+.panels { padding: 8px; display: flex; flex-direction: column; gap: 6px; margin-top: 4px; border-top: 1px solid var(--border); }
+.miniPanel { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; }
+.miniTitle { font-size: 8px; font-weight: 700; letter-spacing: 0.12em; color: var(--text-faint); margin-bottom: 3px; }
+.miniVal   { font-size: 11px; font-weight: 700; }
+
+.footer { margin-top: auto; padding: 10px 12px; border-top: 1px solid var(--border); }
+.footerText { font-size: 8px; font-weight: 700; letter-spacing: 0.14em; color: var(--text-faint); }
+.footerSub  { font-size: 8px; color: var(--text-faint); margin-top: 2px; opacity: 0.6; }

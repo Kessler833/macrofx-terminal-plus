@@ -1,0 +1,10 @@
+.wrap { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.regimeRow { display: grid; grid-template-columns: 1fr 2fr; gap: 12px; }
+.regimeCard { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.regimeBody { padding: 16px; display: flex; align-items: center; justify-content: center; }
+.regimeBig  { font-size: 22px; font-weight: 700; letter-spacing: 0.1em; }
+.condGrid   { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+.condItem   { display: flex; flex-direction: column; gap: 3px; padding: 12px 14px; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); }
+.condLabel  { font-size: 8px; font-weight: 700; letter-spacing: 0.12em; color: var(--text-faint); text-transform: uppercase; }
+.tableWrap  { overflow-x: auto; }
+.corrWrap   { overflow-x: auto; padding: 8px; }

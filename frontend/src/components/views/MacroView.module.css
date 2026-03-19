@@ -1,0 +1,16 @@
+.wrap { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.tableWrap { overflow-x: auto; }
+.diffGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; padding: 12px; }
+.diffCard { display: flex; align-items: center; gap: 8px; }
+.diffPair { font-size: 10px; font-weight: 700; width: 60px; }
+.diffBarWrap { flex: 1; height: 4px; background: rgba(120,120,170,0.15); border-radius: 2px; }
+.diffBar { height: 100%; border-radius: 2px; transition: width 0.5s; }
+.diffVal { font-size: 10px; font-weight: 700; width: 44px; text-align: right; }
+.macroGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
+.macroCard { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.macroCardHeader { display: flex; align-items: center; gap: 6px; }
+.macroCode  { font-size: 13px; font-weight: 700; flex: 1; }
+.macroScore { font-size: 13px; font-weight: 700; }
+.macroRate  { display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--border); padding-top: 6px; }
+.macroFactors { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.macroFactor  { display: flex; justify-content: space-between; align-items: center; background: var(--bg-secondary); border-radius: 3px; padding: 3px 6px; }

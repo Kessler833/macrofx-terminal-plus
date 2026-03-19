@@ -1,0 +1,28 @@
+{
+  "name": "macrofx-terminal-plus",
+  "version": "1.0.0",
+  "description": "Institutional macro swing trading terminal — CMSI engine, live FX, backtest",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k -n VITE,ELECTRON -c cyan,yellow \"npm run dev:vite\" \"wait-on tcp:localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "dev:vite": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "start": "electron .",
+    "install:all": "npm install && cd frontend && npm install"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^29.0.0",
+    "electron-builder": "^24.13.3",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.kessler833.macrofx",
+    "productName": "MacroFX Terminal Plus",
+    "directories": { "output": "dist-electron" },
+    "files": ["electron/**", "frontend/dist/**", "backend/**"],
+    "win": { "target": "nsis" },
+    "mac": { "target": "dmg" }
+  }
+}

@@ -1,0 +1,15 @@
+.wrap { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.paramGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; padding: 14px; }
+.paramItem { display: flex; flex-direction: column; gap: 5px; }
+.paramItem label { font-size: 8px; font-weight: 700; letter-spacing: 0.12em; color: var(--text-secondary); text-transform: uppercase; }
+.paramItem select, .paramItem input { width: 100%; }
+.statsGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+.statCard  { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; }
+.statLabel { font-size: 8px; font-weight: 700; letter-spacing: 0.1em; color: var(--text-secondary); text-transform: uppercase; margin-bottom: 4px; }
+.statVal   { font-size: 16px; font-weight: 700; }
+.chartWrap  { height: 280px; padding: 12px; }
+.monthlyWrap { overflow-x: auto; }
+.monthlyWrap table { min-width: 900px; }
+.tradeWrap  { overflow-x: auto; max-height: 340px; overflow-y: auto; }
+.errorBox   { background: rgba(255,68,102,0.1); border: 1px solid rgba(255,68,102,0.3); border-radius: 6px; padding: 12px; color: var(--red); font-size: 11px; }
+.loadingBox { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; padding: 16px; color: var(--accent); font-size: 11px; text-align: center; }
