@@ -1,7 +1,7 @@
 from __future__ import annotations
-import asyncio, logging, time
+import asyncio, csv, io, logging, math, time
 from datetime import date, timedelta
-from typing import Dict, Optional, Any
+from typing import Dict, List, Optional, Any
 
 import httpx
 
@@ -14,32 +14,74 @@ PAIRS_DEFAULT = [
     "AUDNZD","EURJPY","CADJPY","CHFJPY","EURCHF",
 ]
 
-# ── FRED series IDs per currency ──────────────────────────────────────────────
-# CPI series: MoM change in consumer prices (or closest available)
-# Rate series: overnight/policy rate
+# ── FRED series IDs ───────────────────────────────────────────────────────────
 FRED_CPI_SERIES: Dict[str, str] = {
-    "USD": "CPIAUCSL",      # US CPI All Urban Consumers
-    "EUR": "CP0000EZ19M086NEST",  # Euro area HICP
-    "GBP": "GBRCPIALLMINMEI",    # UK CPI all items
-    "JPY": "JPNCPIALLMINMEI",    # Japan CPI all items
-    "AUD": "AUSCPIALLQINMEI",    # Australia CPI (quarterly — FRED best available)
-    "NZD": "NZLCPIALLQINMEI",    # New Zealand CPI (quarterly)
-    "CAD": "CPALCY01CAM661N",    # Canada CPI
-    "CHF": "CHECPIALLMINMEI",    # Switzerland CPI
+    "USD": "CPIAUCSL",
+    "EUR": "CP0000EZ19M086NEST",
+    "GBP": "GBRCPIALLMINMEI",
+    "JPY": "JPNCPIALLMINMEI",
+    "AUD": "AUSCPIALLQINMEI",
+    "NZD": "NZLCPIALLQINMEI",
+    "CAD": "CPALCY01CAM661N",
+    "CHF": "CHECPIALLMINMEI",
 }
 
 FRED_RATE_SERIES: Dict[str, str] = {
-    "USD": "FEDFUNDS",           # US Federal Funds Rate
-    "GBP": "IUDSOIA",           # Bank Rate (BoE) — FRED code
-    "JPY": "IRSTCB01JPM156N",   # Japan call rate / BoJ policy
-    "AUD": "IRSTCB01AUM156N",   # RBA cash rate
-    "NZD": "IRSTCB01NZM156N",   # RBNZ OCR
-    "CAD": "IRSTCB01CAM156N",   # BoC overnight rate
-    "CHF": "IRSTCB01CHM156N",   # SNB policy rate
-    # EUR is fetched directly from ECB — not FRED
+    "USD": "FEDFUNDS",
+    "GBP": "IUDSOIA",
+    "JPY": "IRSTCB01JPM156N",
+    "AUD": "IRSTCB01AUM156N",
+    "NZD": "IRSTCB01NZM156N",
+    "CAD": "IRSTCB01CAM156N",
+    "CHF": "IRSTCB01CHM156N",
 }
 
-# Bank labels and hawkish/dovish thresholds
+# PPI: Producer Price Index (MoM change)
+FRED_PPI_SERIES: Dict[str, str] = {
+    "USD": "PPIACO",           # US PPI all commodities
+    "EUR": "PIEAMP01EZM661N",  # Euro area PPI
+    "GBP": "PIEAMP01GBM661N",  # UK PPI
+    "JPY": "PIEAMP01JPM661N",  # Japan PPI
+    "AUD": "PIEAMP01AUM661N",  # Australia PPI
+    "NZD": "PIEAMP01NZM661N",  # New Zealand PPI
+    "CAD": "PIEAMP01CAM661N",  # Canada PPI
+    "CHF": "PIEAMP01CHM661N",  # Switzerland PPI
+}
+
+# PCE: Personal Consumption Expenditures (USD only; others approximate via CPI)
+FRED_PCE_SERIES: Dict[str, str] = {
+    "USD": "PCEPI",            # US PCE price index
+}
+
+# US-only labor market series (USD heatmap row)
+FRED_LABOR_USD: Dict[str, str] = {
+    "nfp":    "PAYEMS",        # Non-Farm Payrolls (thousands)
+    "urate":  "UNRATE",        # Unemployment Rate %
+    "claims": "ICSA",          # Initial Jobless Claims
+    "adp":    "ADPWNUSNERSA",  # ADP Private Employment
+    "jolts":  "JTSJOL",        # JOLTS Job Openings
+}
+
+# International unemployment rates for URATE column
+FRED_URATE_INTL: Dict[str, str] = {
+    "EUR": "LRHUTTTTEZM156S",  # Euro area unemployment rate
+    "GBP": "LRHUTTTTGBM156S",  # UK unemployment rate
+    "JPY": "LRHUTTTTJPM156S",  # Japan unemployment rate
+    "AUD": "LRHUTTTTAUM156S",  # Australia unemployment rate
+    "NZD": "LRHUTTTTNTM156S",  # New Zealand unemployment
+    "CAD": "LRHUTTTTCAM156S",  # Canada unemployment rate
+    "CHF": "LRHUTTTTTCHM156S", # Switzerland unemployment rate
+}
+
+# International NFP equivalents (employment growth %)
+FRED_EMPLOY_INTL: Dict[str, str] = {
+    "EUR": "LFEMTTTTEZM647S",  # Euro area employment
+    "GBP": "LCEAMN01GBM661S",  # UK employment change
+    "JPY": "LCEAMN01JPM661S",  # Japan employment
+    "AUD": "LCEAMN01AUM661S",  # Australia employment
+    "CAD": "LCEAMN01CAM661S",  # Canada employment
+}
+
 CB_META_STATIC: Dict[str, dict] = {
     "USD": {"bank": "Federal Reserve",  "hawk_above": 4.0,  "dove_below": 2.0},
     "EUR": {"bank": "ECB",              "hawk_above": 2.5,  "dove_below": 1.5},
@@ -49,6 +91,36 @@ CB_META_STATIC: Dict[str, dict] = {
     "NZD": {"bank": "RBNZ",             "hawk_above": 3.5,  "dove_below": 2.0},
     "CAD": {"bank": "Bank of Canada",   "hawk_above": 3.5,  "dove_below": 2.0},
     "CHF": {"bank": "SNB",              "hawk_above": 1.0,  "dove_below": 0.0},
+}
+
+# ── CFTC: currency → legacy report code ──────────────────────────────────────
+CFTC_CODES: Dict[str, str] = {
+    "EUR": "099741",
+    "GBP": "096742",
+    "JPY": "097741",
+    "AUD": "232741",
+    "NZD": "112741",
+    "CAD": "090741",
+    "CHF": "092741",
+}
+
+# ── Finnhub: ISM economic event codes ────────────────────────────────────────
+FINNHUB_PMI: Dict[str, Dict[str, str]] = {
+    "USD": {"m": "ISM Manufacturing PMI", "s": "ISM Services PMI"},
+    "EUR": {"m": "Manufacturing PMI",     "s": "Services PMI"},
+    "GBP": {"m": "Manufacturing PMI",     "s": "Services PMI"},
+    "JPY": {"m": "Manufacturing PMI",     "s": "Services PMI"},
+    "AUD": {"m": "Manufacturing PMI",     "s": "Services PMI"},
+    "NZD": {"m": "Manufacturing PMI",     "s": "Services PMI"},
+    "CAD": {"m": "Manufacturing PMI",     "s": "Services PMI"},
+    "CHF": {"m": "Manufacturing PMI",     "s": "Services PMI"},
+}
+
+# Country codes for Finnhub economic calendar
+FINNHUB_COUNTRY: Dict[str, str] = {
+    "USD": "US", "EUR": "EU", "GBP": "GB",
+    "JPY": "JP", "AUD": "AU", "NZD": "NZ",
+    "CAD": "CA", "CHF": "CH",
 }
 
 
@@ -63,15 +135,46 @@ class DataFetcher:
         self.cb_meta:     dict = {}
         self.gdp_vals:    Dict[str, float] = {}
         self.cpi_changes: Dict[str, float] = {}
+        self.ppi_changes: Dict[str, float] = {}
+        self.pce_changes: Dict[str, float] = {}
         self.news_scores: Dict[str, int]   = {}
+
+        # Labor market data (per currency where available)
+        self.nfp_vals:    Dict[str, float] = {}  # MoM change in employment
+        self.urate_vals:  Dict[str, float] = {}  # Unemployment %
+        self.claims_vals: Dict[str, float] = {}  # Initial claims (USD only)
+        self.adp_vals:    Dict[str, float] = {}  # ADP (USD only)
+        self.jolts_vals:  Dict[str, float] = {}  # JOLTS openings (USD only)
+
+        # PMI data per currency
+        self.pmi_data: Dict[str, Dict[str, float]] = {}  # {"USD": {"m": 51.5, "s": 53.2}}
+
+        # COT data per currency: net positioning score -2 to +2
+        self.cot_data:  Dict[str, int] = {}
+
+        # Crowd/retail sentiment per currency: contrarian score -2 to +2
+        self.crowd_data: Dict[str, int] = {}
+
+        # Trend from FX history MA cross (replaces Alpha Vantage)
+        self.trend_data: Dict[str, int] = {}
 
         self.data_sources: Dict[str, str] = {
             "cb_rates": "pending",
             "gdp":      "pending",
             "cpi":      "pending",
+            "ppi":      "pending",
+            "pce":      "pending",
+            "nfp":      "pending",
+            "urate":    "pending",
+            "claims":   "pending",
+            "adp":      "pending",
+            "jolts":    "pending",
             "fx":       "pending",
             "news":     "pending",
-            "av":       "pending",
+            "pmi":      "pending",
+            "cot":      "pending",
+            "crowd":    "pending",
+            "trend":    "pending",
         }
 
         self.api_status: Dict[str, str] = {
@@ -79,15 +182,16 @@ class DataFetcher:
             "fred":      "pending",
             "worldbank": "pending",
             "news":      "pending",
-            "av":        "pending",
             "ecb":       "pending",
+            "finnhub":   "pending",
+            "cftc":      "pending",
+            "myfxbook":  "pending",
         }
 
         self.api_errors: Dict[str, Any] = {}
 
         self.fetch_ts: Dict[str, float] = {
-            "cb_rates": 0, "gdp": 0, "cpi": 0,
-            "fx": 0, "news": 0, "av": 0,
+            k: 0 for k in self.data_sources
         }
 
     @property
@@ -169,17 +273,17 @@ class DataFetcher:
                 return True
             except Exception as e:
                 last_exc  = e
-                last_code = getattr(getattr(e, 'response', None), 'status_code', None)
+                last_code = getattr(getattr(e, "response", None), "status_code", None)
         self.api_status["fx"]   = "error"
         self.data_sources["fx"] = "error"
         if last_exc:
             self._record_error("fx", last_exc, last_code)
         return False
 
-    # ── FX History ────────────────────────────────────────────────────────
+    # ── FX History (used for TREND derivation) ────────────────────────────
     async def fetch_fx_history(self) -> bool:
         end   = date.today()
-        start = end - timedelta(days=92)
+        start = end - timedelta(days=200)  # ~28 weekly bars for MA20
         url   = (f"https://api.frankfurter.app/{start}..{end}"
                  f"?base=USD&symbols=EUR,GBP,JPY,AUD,NZD,CAD,CHF")
         try:
@@ -189,13 +293,46 @@ class DataFetcher:
             if not data:
                 raise ValueError("Empty history")
             self.fx_history = data
+            self._derive_trends_from_history()
             return True
         except Exception as e:
-            self._record_error("fx_history", e,
-                getattr(getattr(e, 'response', None), 'status_code', None))
+            self._record_error("trend", e,
+                getattr(getattr(e, "response", None), "status_code", None))
             return False
 
-    # ── ECB Deposit Rate (free, no key) ───────────────────────────────────
+    def _derive_trends_from_history(self) -> None:
+        """Compute MA8 vs MA20 trend score from Frankfurter history. Replaces Alpha Vantage."""
+        targets = ["EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"]
+        dates   = sorted(self.fx_history.keys())
+        any_ok  = False
+        for cur in targets:
+            prices: List[float] = []
+            for d in reversed(dates):
+                v = self.fx_history[d].get(cur)
+                if v is not None:
+                    prices.append(float(v))
+            if len(prices) < 20:
+                continue
+            # prices[0] = most recent
+            ma8  = sum(prices[:8])  / 8
+            ma20 = sum(prices[:20]) / 20
+            p    = prices[0]
+            self.trend_data[cur] = (
+                 2 if p > ma8 > ma20 else
+                 1 if p > ma8        else
+                -2 if p < ma8 < ma20 else -1
+            )
+            any_ok = True
+        # USD trend: inverse of basket average
+        if self.trend_data:
+            avg = sum(self.trend_data.values()) / len(self.trend_data)
+            self.trend_data["USD"] = max(-2, min(2, -round(avg)))
+        if any_ok:
+            self.data_sources["trend"] = "live"
+            self.fetch_ts["trend"]     = time.time()
+            self.api_errors.pop("trend", None)
+
+    # ── ECB Deposit Rate ──────────────────────────────────────────────────
     async def fetch_ecb_rate(self) -> bool:
         url = ("https://data-api.ecb.europa.eu/service/data/FM/"
                "B.U2.EUR.4F.KR.DFR.LEV?lastNObservations=2&format=json")
@@ -211,7 +348,7 @@ class DataFetcher:
             latest_key = max(obs.keys(), key=int)
             val = float(obs[latest_key][0])
             self._store_cb_rate("EUR", val)
-            self.api_status["ecb"]       = "ok"
+            self.api_status["ecb"]        = "ok"
             self.data_sources["cb_rates"] = "live"
             self.fetch_ts["cb_rates"]     = time.time()
             self.api_errors.pop("cb_rates", None)
@@ -219,11 +356,10 @@ class DataFetcher:
         except Exception as e:
             self.api_status["ecb"] = "error"
             self._record_error("cb_rates", e,
-                getattr(getattr(e, 'response', None), 'status_code', None))
+                getattr(getattr(e, "response", None), "status_code", None))
             return False
 
     def _store_cb_rate(self, cur: str, val: float) -> None:
-        """Store a CB rate and update meta."""
         self.cb_rates[cur] = round(val, 3)
         meta = CB_META_STATIC.get(cur, {})
         self.cb_meta[cur] = {
@@ -261,7 +397,7 @@ class DataFetcher:
                 self.gdp_vals[cur] = round(obs[0]["value"], 2)
                 ok = True
             except Exception as e:
-                code = getattr(getattr(e, 'response', None), 'status_code', None)
+                code = getattr(getattr(e, "response", None), "status_code", None)
                 errors.append(f"{cur}:{code or str(e)[:40]}")
 
         await asyncio.gather(*[_fetch_one(c, i) for c, i in wb_map.items()])
@@ -281,25 +417,26 @@ class DataFetcher:
             }
         return ok
 
-    # ── FRED: CPI + CB rates for all currencies ───────────────────────────
+    # ── FRED: all economic indicators ─────────────────────────────────────
     async def fetch_fred(self) -> bool:
         key = self.cfg.get("fred_api_key", "").strip()
         if not key:
-            self.api_status["fred"]  = "no_key"
-            self.data_sources["cpi"] = "no_key"
-            self.api_errors["cpi"] = {
-                "error":      "No FRED API key configured",
-                "error_type": "NO_KEY",
-                "http_code":  None,
-                "ts":         int(time.time()),
-            }
+            for ds in ["cpi","ppi","pce","cb_rates","nfp","urate","claims","adp","jolts"]:
+                self.data_sources[ds] = "no_key"
+                self.api_errors[ds] = {
+                    "error":      "No FRED API key configured",
+                    "error_type": "NO_KEY",
+                    "http_code":  None,
+                    "ts":         int(time.time()),
+                }
+            self.api_status["fred"] = "no_key"
             return False
 
         base_url = "https://api.stlouisfed.org/fred/series/observations"
 
-        async def _series(series_id: str, label: str):
+        async def _series(series_id: str, label: str, n: int = 4):
             url = (f"{base_url}?series_id={series_id}&api_key={key}"
-                   f"&file_type=json&limit=4&sort_order=desc")
+                   f"&file_type=json&limit={n}&sort_order=desc")
             try:
                 r = await self.client.get(url)
                 if r.status_code == 429:
@@ -309,83 +446,329 @@ class DataFetcher:
                 obs = [o for o in r.json().get("observations", [])
                        if o.get("value", ".") != "."]
                 if len(obs) < 2:
-                    raise ValueError(
-                        f"FRED {series_id}: only {len(obs)} obs (need 2)")
+                    raise ValueError(f"FRED {series_id}: only {len(obs)} obs")
                 return {
                     "cur":  float(obs[0]["value"]),
                     "prev": float(obs[1]["value"]),
+                    "vals": [float(o["value"]) for o in obs],
                 }
             except Exception as e:
-                code = getattr(getattr(e, 'response', None), 'status_code', None)
+                code = getattr(getattr(e, "response", None), "status_code", None)
                 logger.warning("[FRED %s/%s] %s", label, series_id, e)
                 return None
 
-        # Build task list: (currency, type, series_id)
-        tasks: list[tuple[str, str, str]] = []
+        # ── Build full task list ──────────────────────────────────────────
+        tasks: list = []
+
         for cur, sid in FRED_CPI_SERIES.items():
-            tasks.append((cur, "cpi", sid))
+            tasks.append(("cpi",    cur, sid))
         for cur, sid in FRED_RATE_SERIES.items():
-            tasks.append((cur, "rate", sid))
-        # Also fetch USD GDP from FRED
-        tasks.append(("USD", "gdp", "A191RL1Q225SBEA"))
+            tasks.append(("rate",   cur, sid))
+        for cur, sid in FRED_PPI_SERIES.items():
+            tasks.append(("ppi",    cur, sid))
+        for cur, sid in FRED_PCE_SERIES.items():
+            tasks.append(("pce",    cur, sid))
+        for metric, sid in FRED_LABOR_USD.items():
+            tasks.append((metric,   "USD", sid))
+        for cur, sid in FRED_URATE_INTL.items():
+            tasks.append(("urate",  cur, sid))
+        for cur, sid in FRED_EMPLOY_INTL.items():
+            tasks.append(("nfp",    cur, sid))
+        # USD GDP from FRED
+        tasks.append(("gdp", "USD", "A191RL1Q225SBEA"))
 
         results = await asyncio.gather(
-            *[_series(sid, f"{cur}/{typ}") for cur, typ, sid in tasks]
+            *[_series(sid, f"{typ}/{cur}") for typ, cur, sid in tasks]
         )
 
-        any_ok   = False
-        cpi_ok   = False
-        rates_ok = False
+        any_ok = False
+        group_ok: Dict[str, bool] = {}
 
-        for (cur, typ, sid), res in zip(tasks, results):
+        for (typ, cur, sid), res in zip(tasks, results):
             if res is None:
                 continue
             any_ok = True
             change = res["cur"] - res["prev"]
+            group_ok[typ] = True
 
             if typ == "cpi":
                 self.cpi_changes[cur] = round(change, 4)
-                cpi_ok = True
 
             elif typ == "rate":
                 self._store_cb_rate(cur, res["cur"])
-                # Patch change into meta
                 if cur in self.cb_meta:
                     self.cb_meta[cur]["change"] = round(change, 3)
-                rates_ok = True
+
+            elif typ == "ppi":
+                self.ppi_changes[cur] = round(change, 4)
+
+            elif typ == "pce":
+                self.pce_changes[cur] = round(change, 4)
 
             elif typ == "gdp" and cur == "USD":
                 self.gdp_vals["USD"] = round(res["cur"], 2)
 
+            elif typ == "nfp":
+                self.nfp_vals[cur] = round(change, 2)
+
+            elif typ == "urate":
+                self.urate_vals[cur] = round(res["cur"], 2)
+
+            elif typ == "claims":
+                self.claims_vals["USD"] = round(change, 0)
+
+            elif typ == "adp":
+                self.adp_vals["USD"] = round(change, 0)
+
+            elif typ == "jolts":
+                self.jolts_vals["USD"] = round(change, 0)
+
         self.api_status["fred"] = "ok" if any_ok else "error"
+        now = time.time()
 
-        if cpi_ok:
-            self.data_sources["cpi"] = "live"
-            self.fetch_ts["cpi"]     = time.time()
-            self.api_errors.pop("cpi", None)
-        else:
-            self.data_sources["cpi"] = "error"
-            self.api_errors["cpi"] = {
-                "error":      "FRED CPI fetch failed for all currencies",
-                "error_type": "HTTP_ERROR",
-                "http_code":  None,
-                "ts":         int(time.time()),
-            }
-
-        if rates_ok:
-            self.data_sources["cb_rates"] = "live"
-            self.fetch_ts["cb_rates"]      = time.time()
-            self.api_errors.pop("cb_rates", None)
-
-        if not any_ok:
-            self.api_errors["cpi"] = {
-                "error":      "FRED returned no usable data (check key validity)",
-                "error_type": "HTTP_ERROR",
-                "http_code":  None,
-                "ts":         int(time.time()),
-            }
+        for ds in ["cpi","ppi","pce","cb_rates","nfp","urate","claims","adp","jolts"]:
+            if group_ok.get(ds) or group_ok.get("rate") and ds == "cb_rates":
+                self.data_sources[ds] = "live"
+                self.fetch_ts[ds]     = now
+                self.api_errors.pop(ds, None)
+            elif ds not in self.api_errors:
+                self.data_sources[ds] = "error"
+                self.api_errors[ds]   = {
+                    "error":      f"FRED {ds}: no data returned",
+                    "error_type": "HTTP_ERROR",
+                    "http_code":  None,
+                    "ts":         int(now),
+                }
 
         return any_ok
+
+    # ── Finnhub: PMI (MPMI + SPMI) ───────────────────────────────────────
+    async def fetch_pmi_finnhub(self) -> bool:
+        key = self.cfg.get("finnhub_api_key", "").strip()
+        if not key:
+            self.api_status["finnhub"]  = "no_key"
+            self.data_sources["pmi"]    = "no_key"
+            self.api_errors["pmi"] = {
+                "error":      "No Finnhub API key configured",
+                "error_type": "NO_KEY",
+                "http_code":  None,
+                "ts":         int(time.time()),
+            }
+            return False
+
+        end   = date.today().isoformat()
+        start = (date.today() - timedelta(days=45)).isoformat()
+        any_ok = False
+
+        for cur, country in FINNHUB_COUNTRY.items():
+            url = (f"https://finnhub.io/api/v1/calendar/economic"
+                   f"?from={start}&to={end}&token={key}")
+            try:
+                r = await self.client.get(url)
+                if r.status_code == 429:
+                    self.api_errors["pmi"] = {
+                        "error": "Finnhub rate limit",
+                        "error_type": "RATE_LIMIT",
+                        "http_code": 429,
+                        "ts": int(time.time()),
+                    }
+                    break
+                r.raise_for_status()
+                events = r.json().get("economicCalendar", [])
+
+                m_val: Optional[float] = None
+                s_val: Optional[float] = None
+
+                for ev in reversed(events):
+                    if ev.get("country", "").upper() != country:
+                        continue
+                    name = (ev.get("event") or "").lower()
+                    actual = ev.get("actual")
+                    if actual is None:
+                        continue
+                    try:
+                        actual = float(actual)
+                    except (ValueError, TypeError):
+                        continue
+                    if "manufacturing pmi" in name or "ism manufacturing" in name:
+                        if m_val is None:
+                            m_val = actual
+                    if "services pmi" in name or "ism services" in name or "non-manufacturing" in name:
+                        if s_val is None:
+                            s_val = actual
+
+                if m_val is not None or s_val is not None:
+                    self.pmi_data[cur] = {
+                        "m": m_val if m_val is not None else 50.0,
+                        "s": s_val if s_val is not None else 50.0,
+                    }
+                    any_ok = True
+
+                await asyncio.sleep(0.3)  # Finnhub free: 60 req/min
+            except Exception as e:
+                logger.warning("[FINNHUB PMI %s] %s", cur, e)
+
+        if any_ok:
+            self.api_status["finnhub"]  = "ok"
+            self.data_sources["pmi"]    = "live"
+            self.fetch_ts["pmi"]        = time.time()
+            self.api_errors.pop("pmi", None)
+        else:
+            self.api_status["finnhub"]  = "error"
+            self.data_sources["pmi"]    = "error"
+        return any_ok
+
+    # ── CFTC: Commitments of Traders (COT) ───────────────────────────────
+    async def fetch_cot(self) -> bool:
+        """
+        Downloads the official CFTC legacy futures-only COT report (CSV).
+        Free, no API key required. Updated every Friday ~3:30 PM ET.
+        """
+        year  = date.today().year
+        # Try current year first, fall back to prior year
+        for y in [year, year - 1]:
+            url = f"https://www.cftc.gov/files/dea/history/fut_fin_txt_{y}.zip"
+            try:
+                import zipfile
+
+                r = await self.client.get(url, timeout=30.0)
+                if r.status_code == 404:
+                    continue
+                r.raise_for_status()
+
+                # Parse zip in-memory
+                with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+                    csv_name = next((n for n in zf.namelist() if n.endswith(".txt") or n.endswith(".csv")), None)
+                    if not csv_name:
+                        raise ValueError("No CSV in CFTC zip")
+                    raw = zf.read(csv_name).decode("utf-8", errors="replace")
+
+                reader  = csv.DictReader(io.StringIO(raw))
+                latest: Dict[str, dict] = {}
+
+                for row in reader:
+                    cftc_code = row.get("CFTC_Contract_Market_Code", "").strip()
+                    matched   = None
+                    for cur, code in CFTC_CODES.items():
+                        if cftc_code == code:
+                            matched = cur
+                            break
+                    if matched is None:
+                        continue
+                    # Keep only the most recent row (CSV is sorted oldest→newest)
+                    latest[matched] = row
+
+                any_ok = False
+                for cur, row in latest.items():
+                    try:
+                        longs  = float(row.get("NonComm_Positions_Long_All",  0) or 0)
+                        shorts = float(row.get("NonComm_Positions_Short_All", 0) or 0)
+                        total  = longs + shorts
+                        if total < 100:
+                            continue
+                        net_pct = (longs - shorts) / total  # -1 to +1
+                        if net_pct >  0.30: score =  2
+                        elif net_pct > 0.10: score =  1
+                        elif net_pct < -0.30: score = -2
+                        elif net_pct < -0.10: score = -1
+                        else:                score =  0
+                        self.cot_data[cur] = score
+                        any_ok = True
+                    except (ValueError, TypeError, ZeroDivisionError):
+                        continue
+
+                if any_ok:
+                    self.api_status["cftc"]  = "ok"
+                    self.data_sources["cot"] = "live"
+                    self.fetch_ts["cot"]     = time.time()
+                    self.api_errors.pop("cot", None)
+                    return True
+
+            except Exception as e:
+                logger.warning("[CFTC COT y=%s] %s", y, e)
+
+        self.api_status["cftc"]  = "error"
+        self.data_sources["cot"] = "error"
+        self.api_errors["cot"]   = {
+            "error":      "CFTC COT fetch failed",
+            "error_type": "HTTP_ERROR",
+            "http_code":  None,
+            "ts":         int(time.time()),
+        }
+        return False
+
+    # ── MyFXBook: retail sentiment (CROWD) ───────────────────────────────
+    async def fetch_crowd_myfxbook(self) -> bool:
+        """
+        MyFXBook community outlook — retail long/short % per pair.
+        Free, no API key required.
+        Contrarian: heavy retail long → bearish signal for that currency.
+        """
+        url = "https://www.myfxbook.com/api/get-community-outlook.json"
+        try:
+            r = await self.client.get(url, timeout=15.0)
+            r.raise_for_status()
+            data = r.json()
+            symbols = data.get("symbols", {}).get("symbol", [])
+            if not symbols:
+                raise ValueError("MyFXBook: empty symbols")
+
+            # Aggregate sentiment per currency across all pairs
+            cur_long:  Dict[str, List[float]] = {c: [] for c in CURRENCIES}
+            cur_short: Dict[str, List[float]] = {c: [] for c in CURRENCIES}
+
+            for sym in symbols:
+                name = (sym.get("name") or "").upper().replace("/", "")
+                if len(name) != 6:
+                    continue
+                base, quote = name[:3], name[3:]
+                try:
+                    long_pct  = float(sym.get("longPercentage",  50))
+                    short_pct = float(sym.get("shortPercentage", 50))
+                except (TypeError, ValueError):
+                    continue
+                if base in cur_long:
+                    cur_long[base].append(long_pct)
+                    cur_short[base].append(short_pct)
+                if quote in cur_long:
+                    # quote currency: retail long the pair = bearish for quote
+                    cur_long[quote].append(short_pct)
+                    cur_short[quote].append(long_pct)
+
+            any_ok = False
+            for cur in CURRENCIES:
+                ls = cur_long[cur]
+                if not ls:
+                    continue
+                avg_long = sum(ls) / len(ls)
+                # Contrarian logic: if retail > 65% long → bearish (-1 or -2)
+                if avg_long > 75:   score = -2
+                elif avg_long > 60: score = -1
+                elif avg_long < 25: score =  2
+                elif avg_long < 40: score =  1
+                else:               score =  0
+                self.crowd_data[cur] = score
+                any_ok = True
+
+            if any_ok:
+                self.api_status["myfxbook"]  = "ok"
+                self.data_sources["crowd"]   = "live"
+                self.fetch_ts["crowd"]       = time.time()
+                self.api_errors.pop("crowd", None)
+                return True
+
+            raise ValueError("MyFXBook: no pairs parsed")
+
+        except Exception as e:
+            self.api_status["myfxbook"]  = "error"
+            self.data_sources["crowd"]   = "error"
+            self.api_errors["crowd"] = {
+                "error":      str(e)[:200],
+                "error_type": "HTTP_ERROR",
+                "http_code":  getattr(getattr(e, "response", None), "status_code", None),
+                "ts":         int(time.time()),
+            }
+            return False
 
     # ── News sentiment ────────────────────────────────────────────────────
     async def fetch_news_sentiment(self) -> bool:
@@ -459,79 +842,8 @@ class DataFetcher:
             }
         return ok
 
-    # ── Alpha Vantage FX trend ────────────────────────────────────────────
-    async def fetch_av_trends(self, trend_overrides: dict) -> bool:
-        key = self.cfg.get("alpha_vantage_key", "").strip()
-        if not key:
-            self.api_status["av"]   = "no_key"
-            self.data_sources["av"] = "no_key"
-            self.api_errors["av"] = {
-                "error":      "No Alpha Vantage API key configured",
-                "error_type": "NO_KEY",
-                "http_code":  None,
-                "ts":         int(time.time()),
-            }
-            return False
-        targets      = ["EUR","GBP","JPY","AUD","NZD","CAD","CHF"]
-        ok           = False
-        rate_limited = False
-        for cur in targets:
-            if rate_limited:
-                break
-            url = (f"https://www.alphavantage.co/query?function=FX_WEEKLY"
-                   f"&from_symbol={cur}&to_symbol=USD&apikey={key}")
-            try:
-                r = await self.client.get(url)
-                r.raise_for_status()
-                data = r.json()
-                if "Note" in data or "Information" in data:
-                    rate_limited = True
-                    self.api_errors["av"] = {
-                        "error":      data.get("Note") or data.get("Information", "AV rate limit"),
-                        "error_type": "RATE_LIMIT",
-                        "http_code":  None,
-                        "ts":         int(time.time()),
-                    }
-                    break
-                series = data.get("Weekly Time Series Forex (FX)", {})
-                if not series:
-                    raise ValueError(f"AV {cur}: no series")
-                dates = sorted(series.keys(), reverse=True)
-                if len(dates) < 20:
-                    raise ValueError(f"AV {cur}: only {len(dates)} bars")
-                price = float(series[dates[0]]["4. close"])
-                ma8   = sum(float(series[d]["4. close"]) for d in dates[:8])  / 8
-                ma20  = sum(float(series[d]["4. close"]) for d in dates[:20]) / 20
-                trend_overrides[cur] = (
-                    2 if price > ma8 > ma20  else
-                    1 if price > ma8         else
-                   -2 if price < ma8 < ma20  else -1
-                )
-                ok = True
-                await asyncio.sleep(1.2)
-            except Exception as e:
-                logger.warning("[AV %s] %s", cur, e)
-        if ok:
-            self.api_status["av"]   = "ok"
-            self.data_sources["av"] = "live"
-            self.fetch_ts["av"]     = time.time()
-            if not rate_limited:
-                self.api_errors.pop("av", None)
-        elif not rate_limited:
-            self.api_status["av"]   = "error"
-            self.data_sources["av"] = "error"
-            if "av" not in self.api_errors:
-                self.api_errors["av"] = {
-                    "error":      "Alpha Vantage: all requests failed",
-                    "error_type": "HTTP_ERROR",
-                    "http_code":  None,
-                    "ts":         int(time.time()),
-                }
-        return ok
-
     # ── Correlation matrix ────────────────────────────────────────────────
     def compute_correlation_matrix(self) -> Dict[str, Dict[str, float]]:
-        import math
         curs  = ["USD","EUR","GBP","JPY","AUD","NZD","CAD","CHF"]
         dates = sorted(self.fx_history.keys())
         series: Dict[str, list] = {}
@@ -565,16 +877,23 @@ class DataFetcher:
 
     # ── Full refresh ──────────────────────────────────────────────────────
     async def refresh_all(self, trend_overrides: dict) -> None:
+        # Phase 1: fast, no-key sources
         await asyncio.gather(
             self.fetch_fx_rates(),
             self.fetch_ecb_rate(),
             self.fetch_gdp(),
+            self.fetch_cot(),
+            self.fetch_crowd_myfxbook(),
             return_exceptions=True
         )
+        # Phase 2: keyed sources + FX history (for trend)
         await asyncio.gather(
             self.fetch_fred(),
             self.fetch_news_sentiment(),
-            self.fetch_av_trends(trend_overrides),
+            self.fetch_pmi_finnhub(),
+            self.fetch_fx_history(),
             return_exceptions=True
         )
-        await self.fetch_fx_history()
+        # Merge derived trend data into trend_overrides for cmsi_engine
+        for cur, val in self.trend_data.items():
+            trend_overrides[cur] = val
