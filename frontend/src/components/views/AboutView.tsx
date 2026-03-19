@@ -154,7 +154,7 @@ export default function AboutView({ apiStatus }: Props) {
       </div>
 
       <div className={s.footer}>
-        MacroFX Terminal Plus — built by Kessler833 · Electron {typeof process !== 'undefined' ? process.versions?.electron ?? '29' : '29'} · React 18 · FastAPI 0.110<br />
+        MacroFX Terminal Plus — built by Kessler833 · Electron 29+ · React 18 · FastAPI 0.110<br />
         Data: Frankfurter API · World Bank · ECB Data Portal · FRED · Alpha Vantage · NewsAPI<br />
         This terminal is for informational and research purposes only. Not financial advice.
       </div>
