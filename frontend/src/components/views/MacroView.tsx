@@ -3,6 +3,13 @@ import styles from './MacroView.module.css'
 
 interface Props { state: MacroState }
 
+// Safe number helpers — never crash on null/undefined from backend
+const fmt = (v: number | null | undefined, decimals = 2, fallback = '—') =>
+  v == null ? fallback : v.toFixed(decimals)
+
+const fmtSigned = (v: number | null | undefined, decimals = 2) =>
+  v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(decimals)
+
 export default function MacroView({ state }: Props) {
   const waiting    = state.ts === 0
   const provenance = state.provenance ?? {}
@@ -57,23 +64,26 @@ export default function MacroView({ state }: Props) {
                       {!r.is_live && <span title="Static data" style={{ color: 'var(--yellow)', fontSize: '8px', marginLeft: 4 }}>~</span>}
                     </td>
                     <td style={{ color: 'var(--text-secondary)', fontSize: '10px' }}>{r.bank}</td>
-                    <td style={{ fontWeight: 700, color: 'var(--cyan)' }}>{r.rate.toFixed(2)}%</td>
-                    <td style={{ color: r.change > 0 ? 'var(--green)' : r.change < 0 ? 'var(--red)' : 'var(--text-secondary)', fontWeight: 600 }}>
-                      {r.change >= 0 ? '+' : ''}{r.change.toFixed(2)}%
+                    <td style={{ fontWeight: 700, color: 'var(--cyan)' }}>{fmt(r.rate)}%</td>
+                    <td style={{
+                      color: (r.change ?? 0) > 0 ? 'var(--green)' : (r.change ?? 0) < 0 ? 'var(--red)' : 'var(--text-secondary)',
+                      fontWeight: 600,
+                    }}>
+                      {fmtSigned(r.change)}%
                     </td>
                     <td style={{ color: 'var(--text-secondary)', fontSize: '10px' }}>{r.next_mtg}</td>
                     <td>
                       <span style={{
                         color: r.stance === 'Hawkish' ? 'var(--green)' : r.stance === 'Dovish' ? 'var(--red)' : 'var(--yellow)',
                         fontWeight: 700, fontSize: '10px'
-                      }}>{r.stance.toUpperCase()}</span>
+                      }}>{(r.stance ?? '—').toUpperCase()}</span>
                     </td>
                     <td>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                         <div style={{ width: '80px', height: '4px', background: 'rgba(120,120,170,0.15)', borderRadius: '2px' }}>
-                          <div style={{ width: `${r.relative}%`, height: '100%', background: 'var(--cyan)', borderRadius: '2px' }} />
+                          <div style={{ width: `${r.relative ?? 0}%`, height: '100%', background: 'var(--cyan)', borderRadius: '2px' }} />
                         </div>
-                        <span style={{ fontSize: '9px', color: 'var(--text-secondary)' }}>{r.relative}%</span>
+                        <span style={{ fontSize: '9px', color: 'var(--text-secondary)' }}>{r.relative ?? 0}%</span>
                       </div>
                     </td>
                   </tr>
@@ -96,12 +106,12 @@ export default function MacroView({ state }: Props) {
                 <span className={styles.diffPair}>{d.pair}</span>
                 <div className={styles.diffBarWrap}>
                   <div className={styles.diffBar} style={{
-                    width: `${Math.min(100, Math.abs(d.diff) / 5 * 100).toFixed(0)}%`,
-                    background: d.diff >= 0 ? 'var(--green)' : 'var(--red)',
+                    width: `${Math.min(100, Math.abs(d.diff ?? 0) / 5 * 100).toFixed(0)}%`,
+                    background: (d.diff ?? 0) >= 0 ? 'var(--green)' : 'var(--red)',
                   }} />
                 </div>
-                <span className={styles.diffVal} style={{ color: d.diff >= 0 ? 'var(--green)' : 'var(--red)' }}>
-                  {d.diff >= 0 ? '+' : ''}{d.diff.toFixed(2)}%
+                <span className={styles.diffVal} style={{ color: (d.diff ?? 0) >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                  {fmtSigned(d.diff)}%
                 </span>
               </div>
             ))}
@@ -128,9 +138,10 @@ export default function MacroView({ state }: Props) {
       ) : (
         <div className={styles.macroGrid}>
           {state.currencies.map(cur => {
+            const score = cur.score ?? 0
             const scoreColor = cur.completeness < 5 ? 'var(--text-secondary)'
-                              : cur.score > 2  ? 'var(--green)'
-                              : cur.score < -2 ? 'var(--red)'
+                              : score > 2  ? 'var(--green)'
+                              : score < -2 ? 'var(--red)'
                               : 'var(--yellow)'
             const cb = state.cb_rates.find(r => r.currency === cur.code)
             return (
@@ -144,7 +155,7 @@ export default function MacroView({ state }: Props) {
                       </span>
                   }
                   <span className={styles.macroScore} style={{ color: scoreColor }}>
-                    {cur.completeness >= 5 ? (cur.score >= 0 ? '+' : '') + cur.score.toFixed(1) : '—'}
+                    {cur.completeness >= 5 ? fmtSigned(cur.score, 1) : '—'}
                   </span>
                 </div>
                 <div style={{ fontSize: '8px', color: 'var(--text-faint)', padding: '0 8px 2px' }}>
@@ -153,16 +164,16 @@ export default function MacroView({ state }: Props) {
                 {cb && (
                   <div className={styles.macroRate}>
                     <span style={{ color: 'var(--text-faint)', fontSize: '8px' }}>RATE{!cb.is_live ? ' ~' : ''}</span>
-                    <span style={{ color: 'var(--cyan)', fontWeight: 700 }}>{cb.rate.toFixed(2)}%</span>
+                    <span style={{ color: 'var(--cyan)', fontWeight: 700 }}>{fmt(cb.rate)}%</span>
                     <span style={{ color: cb.stance === 'Hawkish' ? 'var(--green)' : cb.stance === 'Dovish' ? 'var(--red)' : 'var(--yellow)', fontSize: '9px' }}>
-                      {cb.stance.toUpperCase()}
+                      {(cb.stance ?? '—').toUpperCase()}
                     </span>
                   </div>
                 )}
                 <div className={styles.macroFactors}>
                   {(['cpi','gdp','rates','trend'] as const).map(f => {
                     const v = (cur.factors as any)[f]
-                    const isNA = v === null || v === undefined
+                    const isNA = v == null
                     return (
                       <div key={f} className={styles.macroFactor}>
                         <span style={{ fontSize: '8px', color: 'var(--text-faint)' }}>{f.toUpperCase()}</span>
