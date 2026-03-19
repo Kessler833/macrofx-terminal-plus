@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio, json, logging, time
 from datetime import date
-from typing import Set
+from typing import Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,11 +14,12 @@ from .cmsi_engine  import (
 )
 from .data_fetcher import DataFetcher
 from .backtest     import run_backtest
+from .scheduler    import scheduler, API_WINDOWS
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 logger = logging.getLogger("macrofx.server")
 
-app = FastAPI(title="MacroFX Terminal Plus", version="1.1.1")
+app = FastAPI(title="MacroFX Terminal Plus", version="1.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 cfg             = cfg_load()
@@ -27,8 +28,15 @@ clients:         Set[WebSocket] = set()
 last_state:      dict = {}
 trend_overrides: dict = {}
 
-DEFAULT_REFRESH_S = 900
+# ── Scheduler polling interval (seconds) ─────────────────────────────────────
+# The scheduler loop ticks on this cadence and calls only the sources
+# whose window is due.  Keep it short enough not to miss a window.
+SCHEDULER_TICK_S = 60   # check every minute
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# State builder
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_state() -> dict:
     month = date.today().month - 1
@@ -122,6 +130,9 @@ def build_state() -> dict:
     corr = fetcher.compute_correlation_matrix()
     provenance = fetcher.get_data_provenance()
 
+    # ── Scheduler window info (surfaced to config tab) ────────────────────
+    sched_info = scheduler.window_info()
+
     return {
         "ts":               int(time.time()),
         "currencies":       currencies_data,
@@ -138,9 +149,16 @@ def build_state() -> dict:
         "data_sources":     fetcher.data_sources,
         "provenance":       provenance,
         "config":           cfg,
-        "refresh_interval_s": cfg.get("refresh_interval_s", DEFAULT_REFRESH_S),
+        # Legacy key kept for backwards compat
+        "refresh_interval_s": SCHEDULER_TICK_S,
+        # New: per-source schedule info for the config/status tab
+        "schedule":         sched_info,
     }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Broadcast helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def broadcast(state: dict):
     if not clients:
@@ -155,39 +173,111 @@ async def broadcast(state: dict):
     clients.difference_update(dead)
 
 
-async def refresh_loop():
-    global last_state
-    while True:
-        interval = cfg.get("refresh_interval_s", DEFAULT_REFRESH_S)
-        try:
-            logger.info("[refresh] Starting data refresh cycle (interval=%ds)…", interval)
-            await fetcher.refresh_all(trend_overrides)
-            last_state = build_state()
-            await broadcast(last_state)
-            logger.info(
-                "[refresh] Cycle complete — sources: fx=%s fred=%s gdp=%s news=%s av=%s — broadcasting to %d clients",
-                fetcher.data_sources.get('fx'),
-                fetcher.data_sources.get('cpi'),
-                fetcher.data_sources.get('gdp'),
-                fetcher.data_sources.get('news'),
-                fetcher.data_sources.get('av'),
-                len(clients),
-            )
-        except Exception as e:
-            logger.exception("[refresh] Unhandled error: %s", e)
-        await asyncio.sleep(interval)
+# ─────────────────────────────────────────────────────────────────────────────
+# Smart scheduler loop
+# ─────────────────────────────────────────────────────────────────────────────
 
+async def scheduler_loop():
+    """Tick every SCHEDULER_TICK_S seconds.  Only call APIs whose window is due.
+
+    Force-refreshes are picked up on the very next tick (within 60 s max).
+    A full-state broadcast is sent whenever *any* source is fetched.
+    """
+    global last_state
+    # Give the app a moment to finish startup before first check
+    await asyncio.sleep(2)
+
+    while True:
+        try:
+            fetched_any = False
+
+            # ── Sources that need no key ──────────────────────────────────
+            if scheduler.is_due("fx"):
+                logger.info("[sched] fx: due — fetching")
+                ok = await fetcher.fetch_fx_rates()
+                scheduler.mark_called("fx", ok)
+                fetched_any = True
+
+            if scheduler.is_due("cb_rates"):
+                logger.info("[sched] cb_rates: due — fetching ECB")
+                ok = await fetcher.fetch_ecb_rate()
+                scheduler.mark_called("cb_rates", ok)
+                fetched_any = True
+
+            if scheduler.is_due("gdp"):
+                logger.info("[sched] gdp: due — fetching World Bank")
+                ok = await fetcher.fetch_gdp()
+                scheduler.mark_called("gdp", ok)
+                fetched_any = True
+
+            if scheduler.is_due("fx_history"):
+                logger.info("[sched] fx_history: due — fetching Frankfurter history")
+                ok = await fetcher.fetch_fx_history()
+                scheduler.mark_called("fx_history", ok)
+                fetched_any = True
+
+            # ── Key-gated sources ─────────────────────────────────────────
+            if scheduler.is_due("cpi"):
+                logger.info("[sched] cpi: due — fetching FRED")
+                ok = await fetcher.fetch_fred()
+                scheduler.mark_called("cpi", ok)
+                # FRED also updates cb_rates for USD — sync scheduler record
+                if ok:
+                    scheduler.mark_called("cb_rates", True)
+                fetched_any = True
+
+            if scheduler.is_due("news"):
+                logger.info("[sched] news: due — fetching NewsAPI")
+                ok = await fetcher.fetch_news_sentiment()
+                scheduler.mark_called("news", ok)
+                fetched_any = True
+
+            if scheduler.is_due("av"):
+                logger.info("[sched] av: due — fetching Alpha Vantage")
+                ok = await fetcher.fetch_av_trends(trend_overrides)
+                scheduler.mark_called("av", ok)
+                fetched_any = True
+
+            if fetched_any:
+                last_state = build_state()
+                await broadcast(last_state)
+                logger.info(
+                    "[sched] tick complete — sources fetched, broadcasting to %d clients",
+                    len(clients),
+                )
+            else:
+                # Nothing fetched; still push updated schedule times to clients
+                # so the "next refresh" countdown stays accurate
+                if last_state and clients:
+                    last_state["schedule"] = scheduler.window_info()
+                    last_state["ts"]       = int(time.time())
+                    await broadcast(last_state)
+
+        except Exception as e:
+            logger.exception("[sched] Unhandled error in scheduler loop: %s", e)
+
+        await asyncio.sleep(SCHEDULER_TICK_S)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lifecycle
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup():
+    # Immediately fetch FX spot so the heatmap isn't empty on first load
     asyncio.create_task(fetcher.fetch_fx_rates())
-    asyncio.create_task(refresh_loop())
+    asyncio.create_task(scheduler_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown():
     await fetcher.close()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP endpoints
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -210,41 +300,45 @@ async def update_config(body: ConfigUpdate):
     cfg_save(cfg)
     fetcher.cfg = cfg
 
-    # If a new AV key was provided, immediately mark it as 'pending' so the
-    # frontend shows a spinner rather than staying on the old stale status.
-    # The real ok/error result arrives after refresh_all completes.
-    new_av_key = body.data.get("alpha_vantage_key", "").strip()
-    if new_av_key:
+    # Reset pending states for keys that just changed
+    if body.data.get("alpha_vantage_key", "").strip():
         fetcher.api_status["av"]  = "pending"
         fetcher.api_errors.pop("av", None)
-        logger.info("[config] Alpha Vantage key updated — status reset to pending")
+        scheduler.request_force_refresh("av")
+        logger.info("[config] AV key updated — forcing refresh")
 
-    # Same treatment for FRED key
-    new_fred_key = body.data.get("fred_key", "").strip()
-    if new_fred_key:
+    if body.data.get("fred_key", "").strip() or body.data.get("fred_api_key", "").strip():
         fetcher.api_status["fred"] = "pending"
         fetcher.api_errors.pop("fred", None)
-        logger.info("[config] FRED key updated — status reset to pending")
+        scheduler.request_force_refresh("cpi")
+        logger.info("[config] FRED key updated — forcing refresh")
 
-    # Broadcast immediately so the frontend sees 'pending' right away,
-    # then kick off the background refresh that will resolve it to ok/error.
+    if body.data.get("news_api_key", "").strip():
+        fetcher.api_status["news"] = "pending"
+        fetcher.api_errors.pop("news", None)
+        scheduler.request_force_refresh("news")
+        logger.info("[config] NewsAPI key updated — forcing refresh")
+
     last_state = build_state()
     await broadcast(last_state)
-
-    logger.info("[config] Updated and saved — triggering background refresh")
     asyncio.create_task(_refresh_and_broadcast())
     return {"ok": True}
 
 
 async def _refresh_and_broadcast():
-    """Run a full refresh cycle and push the result to all WS clients."""
+    """Run full refresh (used after config changes) and broadcast."""
     global last_state
     try:
         await fetcher.refresh_all(trend_overrides)
+        # Sync scheduler timestamps from fetcher
+        for src in ("fx", "cb_rates", "gdp", "cpi", "news", "av", "fx_history"):
+            ts = fetcher.fetch_ts.get(src, 0)
+            if ts > 0:
+                scheduler._records[src].last_called_ts = ts
+                scheduler._records[src].force_pending  = False
         last_state = build_state()
         await broadcast(last_state)
-        logger.info("[config/refresh] Post-config refresh complete — av=%s fred=%s",
-                    fetcher.api_status.get('av'), fetcher.api_status.get('fred'))
+        logger.info("[config/refresh] Full refresh complete")
     except Exception as e:
         logger.exception("[config/refresh] Error: %s", e)
 
@@ -276,9 +370,67 @@ async def run_backtest_endpoint(req: BacktestRequest):
 @app.post("/refresh")
 @app.post("/api/refresh")
 @app.get("/api/refresh")
-async def manual_refresh():
-    asyncio.create_task(_refresh_and_broadcast())
-    return {"ok": True, "message": "Refresh triggered"}
+async def manual_refresh(source: Optional[str] = None):
+    """Force-refresh one source or all sources immediately.
+
+    ?source=fx         — refresh only FX spot rates
+    ?source=news       — refresh only news sentiment
+    (no param)         — refresh everything
+
+    This endpoint ALWAYS succeeds regardless of call windows.
+    The actual fetch runs in the background; the scheduler tick
+    will pick it up within SCHEDULER_TICK_S seconds at most.
+    For an instant kick, we also fire the fetch directly here.
+    """
+    global last_state
+
+    if source and source in API_WINDOWS:
+        scheduler.request_force_refresh(source)
+        logger.info("[refresh] Force-refresh requested for source: %s", source)
+        # Fire immediately for instant feedback
+        asyncio.create_task(_fetch_single_and_broadcast(source))
+    else:
+        scheduler.request_force_refresh()  # flag all sources
+        logger.info("[refresh] Force-refresh requested for ALL sources")
+        asyncio.create_task(_refresh_and_broadcast())
+
+    return {"ok": True, "message": f"Force-refresh triggered for {'all sources' if not source else source}"}
+
+
+async def _fetch_single_and_broadcast(source: str):
+    """Fetch exactly one source and broadcast updated state."""
+    global last_state
+    try:
+        ok = False
+        if source == "fx":
+            ok = await fetcher.fetch_fx_rates()
+        elif source == "cb_rates":
+            ok = await fetcher.fetch_ecb_rate()
+            if ok:
+                await fetcher.fetch_fred()  # USD rate lives in FRED
+        elif source == "gdp":
+            ok = await fetcher.fetch_gdp()
+        elif source == "cpi":
+            ok = await fetcher.fetch_fred()
+        elif source == "news":
+            ok = await fetcher.fetch_news_sentiment()
+        elif source == "av":
+            ok = await fetcher.fetch_av_trends(trend_overrides)
+        elif source == "fx_history":
+            ok = await fetcher.fetch_fx_history()
+        scheduler.mark_called(source, ok)
+        last_state = build_state()
+        await broadcast(last_state)
+        logger.info("[refresh/%s] Done — ok=%s", source, ok)
+    except Exception as e:
+        logger.exception("[refresh/%s] Error: %s", source, e)
+
+
+@app.get("/schedule")
+@app.get("/api/schedule")
+async def get_schedule():
+    """Return current scheduler window info for all sources."""
+    return scheduler.window_info()
 
 
 @app.websocket("/ws")
