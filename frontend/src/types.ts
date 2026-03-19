@@ -1,4 +1,4 @@
-// ── Factor scores per currency ────────────────────────────────────────────────
+// ── Factor scores per currency ──────────────────────────────────────────────────
 // null means the data source was unavailable — rendered as N/A, never as 0
 export interface FactorScores {
   trend:  number | null; season: number | null; cot:    number | null; crowd:  number | null;
@@ -46,10 +46,17 @@ export interface RateDiff {
   diff: number
 }
 
+export interface ProvenanceError {
+  error_type: string
+  http_code?: number | null
+  error?:     string
+}
+
 export interface DataProvenance {
   source:    'live' | 'static' | 'error' | 'no_key' | 'pending'
   age_s:     number | null
   is_static?: boolean
+  error?:    ProvenanceError
 }
 
 export interface MacroState {
