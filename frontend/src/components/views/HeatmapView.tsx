@@ -411,13 +411,3 @@ export default function HeatmapView({ state }: Props) {
     </div>
   )
 }
-
-const ERROR_TYPE_LABELS: Record<string, string> = {
-  NO_KEY:        'No API key',
-  RATE_LIMIT:    'Rate limit',
-  HTTP_ERROR:    'HTTP error',
-  TIMEOUT:       'Timeout',
-  PARSE_ERROR:   'Parse error',
-  NETWORK:       'Network error',
-  EMPTY_RESPONSE:'Empty response',
-}
