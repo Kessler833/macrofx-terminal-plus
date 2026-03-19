@@ -19,23 +19,19 @@ from .scheduler    import scheduler, API_WINDOWS
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 logger = logging.getLogger("macrofx.server")
 
-app = FastAPI(title="MacroFX Terminal Plus", version="1.2.0")
+app = FastAPI(title="MacroFX Terminal Plus", version="1.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 cfg             = cfg_load()
 fetcher         = DataFetcher(cfg)
 clients:         Set[WebSocket] = set()
 last_state:      dict = {}
-trend_overrides: dict = {}
 
-# ── Scheduler polling interval (seconds) ─────────────────────────────────────
-# The scheduler loop ticks on this cadence and calls only the sources
-# whose window is due.  Keep it short enough not to miss a window.
-SCHEDULER_TICK_S = 60   # check every minute
+SCHEDULER_TICK_S = 60
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# State builder
+# State builder — passes ALL fetcher data into build_factor_data
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_state() -> dict:
@@ -47,14 +43,19 @@ def build_state() -> dict:
         gdp_vals     = fetcher.gdp_vals,
         cpi_changes  = fetcher.cpi_changes,
         news_scores  = fetcher.news_scores,
-        pmi_data     = None,
-        cot_data     = None,
-        crowd_data   = None,
+        # All FRED-derived indicators now wired through
+        ppi_changes  = fetcher.ppi_changes,
+        pce_changes  = fetcher.pce_changes,
+        nfp_vals     = fetcher.nfp_vals,
+        urate_vals   = fetcher.urate_vals,
+        claims_vals  = fetcher.claims_vals,
+        adp_vals     = fetcher.adp_vals,
+        jolts_vals   = fetcher.jolts_vals,
+        trend_data   = fetcher.trend_data,
+        pmi_data     = fetcher.pmi_data     if fetcher.pmi_data   else None,
+        cot_data     = fetcher.cot_data     if fetcher.cot_data   else None,
+        crowd_data   = fetcher.crowd_data   if fetcher.crowd_data else None,
     )
-
-    for cur, trend in trend_overrides.items():
-        if cur in factor_data:
-            factor_data[cur].trend = trend
 
     completeness = get_factor_completeness(factor_data)
     weights      = cfg.get("factor_weights", {})
@@ -67,6 +68,7 @@ def build_state() -> dict:
         threshold    = cfg.get("signal_threshold", 3.0),
         active_pairs = cfg.get("active_pairs", []),
         completeness = completeness,
+        factor_data  = factor_data,
     )
 
     currencies_data = []
@@ -127,10 +129,8 @@ def build_state() -> dict:
         else None
     )
 
-    corr = fetcher.compute_correlation_matrix()
+    corr      = fetcher.compute_correlation_matrix()
     provenance = fetcher.get_data_provenance()
-
-    # ── Scheduler window info (surfaced to config tab) ────────────────────
     sched_info = scheduler.window_info()
 
     return {
@@ -149,9 +149,7 @@ def build_state() -> dict:
         "data_sources":     fetcher.data_sources,
         "provenance":       provenance,
         "config":           cfg,
-        # Legacy key kept for backwards compat
         "refresh_interval_s": SCHEDULER_TICK_S,
-        # New: per-source schedule info for the config/status tab
         "schedule":         sched_info,
     }
 
@@ -174,24 +172,17 @@ async def broadcast(state: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Smart scheduler loop
+# Scheduler loop
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def scheduler_loop():
-    """Tick every SCHEDULER_TICK_S seconds.  Only call APIs whose window is due.
-
-    Force-refreshes are picked up on the very next tick (within 60 s max).
-    A full-state broadcast is sent whenever *any* source is fetched.
-    """
     global last_state
-    # Give the app a moment to finish startup before first check
     await asyncio.sleep(2)
 
     while True:
         try:
             fetched_any = False
 
-            # ── Sources that need no key ──────────────────────────────────
             if scheduler.is_due("fx"):
                 logger.info("[sched] fx: due — fetching")
                 ok = await fetcher.fetch_fx_rates()
@@ -216,12 +207,10 @@ async def scheduler_loop():
                 scheduler.mark_called("fx_history", ok)
                 fetched_any = True
 
-            # ── Key-gated sources ─────────────────────────────────────────
             if scheduler.is_due("cpi"):
-                logger.info("[sched] cpi: due — fetching FRED")
+                logger.info("[sched] cpi: due — fetching FRED (CPI+PPI+PCE+labor+rates)")
                 ok = await fetcher.fetch_fred()
                 scheduler.mark_called("cpi", ok)
-                # FRED also updates cb_rates for USD — sync scheduler record
                 if ok:
                     scheduler.mark_called("cb_rates", True)
                 fetched_any = True
@@ -232,29 +221,36 @@ async def scheduler_loop():
                 scheduler.mark_called("news", ok)
                 fetched_any = True
 
+            # Alpha Vantage removed — trend now derived from FX history
+            # Finnhub PMI (key-gated)
             if scheduler.is_due("av"):
-                logger.info("[sched] av: due — fetching Alpha Vantage")
-                ok = await fetcher.fetch_av_trends(trend_overrides)
+                logger.info("[sched] pmi: due — fetching Finnhub PMI")
+                ok = await fetcher.fetch_pmi_finnhub()
                 scheduler.mark_called("av", ok)
+                fetched_any = True
+
+            # COT (no key needed)
+            if scheduler.is_due("cot") if hasattr(scheduler, "is_due") else False:
+                logger.info("[sched] cot: due — fetching CFTC")
+                ok = await fetcher.fetch_cot()
+                scheduler.mark_called("cot", ok)
                 fetched_any = True
 
             if fetched_any:
                 last_state = build_state()
                 await broadcast(last_state)
                 logger.info(
-                    "[sched] tick complete — sources fetched, broadcasting to %d clients",
+                    "[sched] tick complete — broadcasting to %d clients",
                     len(clients),
                 )
             else:
-                # Nothing fetched; still push updated schedule times to clients
-                # so the "next refresh" countdown stays accurate
                 if last_state and clients:
                     last_state["schedule"] = scheduler.window_info()
                     last_state["ts"]       = int(time.time())
                     await broadcast(last_state)
 
         except Exception as e:
-            logger.exception("[sched] Unhandled error in scheduler loop: %s", e)
+            logger.exception("[sched] Unhandled error: %s", e)
 
         await asyncio.sleep(SCHEDULER_TICK_S)
 
@@ -265,7 +261,6 @@ async def scheduler_loop():
 
 @app.on_event("startup")
 async def startup():
-    # Immediately fetch FX spot so the heatmap isn't empty on first load
     asyncio.create_task(fetcher.fetch_fx_rates())
     asyncio.create_task(scheduler_loop())
 
@@ -300,13 +295,6 @@ async def update_config(body: ConfigUpdate):
     cfg_save(cfg)
     fetcher.cfg = cfg
 
-    # Reset pending states for keys that just changed
-    if body.data.get("alpha_vantage_key", "").strip():
-        fetcher.api_status["av"]  = "pending"
-        fetcher.api_errors.pop("av", None)
-        scheduler.request_force_refresh("av")
-        logger.info("[config] AV key updated — forcing refresh")
-
     if body.data.get("fred_key", "").strip() or body.data.get("fred_api_key", "").strip():
         fetcher.api_status["fred"] = "pending"
         fetcher.api_errors.pop("fred", None)
@@ -319,6 +307,12 @@ async def update_config(body: ConfigUpdate):
         scheduler.request_force_refresh("news")
         logger.info("[config] NewsAPI key updated — forcing refresh")
 
+    if body.data.get("finnhub_api_key", "").strip():
+        fetcher.api_status["finnhub"] = "pending"
+        fetcher.api_errors.pop("pmi", None)
+        scheduler.request_force_refresh("av")
+        logger.info("[config] Finnhub key updated — forcing PMI refresh")
+
     last_state = build_state()
     await broadcast(last_state)
     asyncio.create_task(_refresh_and_broadcast())
@@ -326,11 +320,9 @@ async def update_config(body: ConfigUpdate):
 
 
 async def _refresh_and_broadcast():
-    """Run full refresh (used after config changes) and broadcast."""
     global last_state
     try:
-        await fetcher.refresh_all(trend_overrides)
-        # Sync scheduler timestamps from fetcher
+        await fetcher.refresh_all({})
         for src in ("fx", "cb_rates", "gdp", "cpi", "news", "av", "fx_history"):
             ts = fetcher.fetch_ts.get(src, 0)
             if ts > 0:
@@ -371,34 +363,19 @@ async def run_backtest_endpoint(req: BacktestRequest):
 @app.post("/api/refresh")
 @app.get("/api/refresh")
 async def manual_refresh(source: Optional[str] = None):
-    """Force-refresh one source or all sources immediately.
-
-    ?source=fx         — refresh only FX spot rates
-    ?source=news       — refresh only news sentiment
-    (no param)         — refresh everything
-
-    This endpoint ALWAYS succeeds regardless of call windows.
-    The actual fetch runs in the background; the scheduler tick
-    will pick it up within SCHEDULER_TICK_S seconds at most.
-    For an instant kick, we also fire the fetch directly here.
-    """
     global last_state
-
     if source and source in API_WINDOWS:
         scheduler.request_force_refresh(source)
-        logger.info("[refresh] Force-refresh requested for source: %s", source)
-        # Fire immediately for instant feedback
+        logger.info("[refresh] Force-refresh: %s", source)
         asyncio.create_task(_fetch_single_and_broadcast(source))
     else:
-        scheduler.request_force_refresh()  # flag all sources
-        logger.info("[refresh] Force-refresh requested for ALL sources")
+        scheduler.request_force_refresh()
+        logger.info("[refresh] Force-refresh: ALL")
         asyncio.create_task(_refresh_and_broadcast())
-
     return {"ok": True, "message": f"Force-refresh triggered for {'all sources' if not source else source}"}
 
 
 async def _fetch_single_and_broadcast(source: str):
-    """Fetch exactly one source and broadcast updated state."""
     global last_state
     try:
         ok = False
@@ -407,7 +384,7 @@ async def _fetch_single_and_broadcast(source: str):
         elif source == "cb_rates":
             ok = await fetcher.fetch_ecb_rate()
             if ok:
-                await fetcher.fetch_fred()  # USD rate lives in FRED
+                await fetcher.fetch_fred()
         elif source == "gdp":
             ok = await fetcher.fetch_gdp()
         elif source == "cpi":
@@ -415,7 +392,7 @@ async def _fetch_single_and_broadcast(source: str):
         elif source == "news":
             ok = await fetcher.fetch_news_sentiment()
         elif source == "av":
-            ok = await fetcher.fetch_av_trends(trend_overrides)
+            ok = await fetcher.fetch_pmi_finnhub()
         elif source == "fx_history":
             ok = await fetcher.fetch_fx_history()
         scheduler.mark_called(source, ok)
@@ -429,7 +406,6 @@ async def _fetch_single_and_broadcast(source: str):
 @app.get("/schedule")
 @app.get("/api/schedule")
 async def get_schedule():
-    """Return current scheduler window info for all sources."""
     return scheduler.window_info()
 
 
