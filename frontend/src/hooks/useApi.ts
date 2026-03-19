@@ -1,39 +1,21 @@
-import { useCallback } from 'react'
+import { apiPost, apiGet } from './useMacroWS'
 
 export function useApi(baseUrl: string) {
-  const saveConfig = useCallback(async (cfg: Record<string, any>) => {
-    try {
-      await fetch(`${baseUrl}/api/config`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(cfg),
-      })
-    } catch (e) {
-      console.error('saveConfig failed', e)
-    }
-  }, [baseUrl])
+  async function saveConfig(config: Record<string, unknown>): Promise<any> {
+    return apiPost('/api/config', config)
+  }
 
-  const triggerRefresh = useCallback(async () => {
-    try {
-      await fetch(`${baseUrl}/api/refresh`, { method: 'POST' })
-    } catch (e) {
-      console.error('triggerRefresh failed', e)
-    }
-  }, [baseUrl])
+  async function triggerRefresh(): Promise<any> {
+    return apiGet('/api/refresh')
+  }
 
-  const runBacktest = useCallback(async (params: Record<string, any>) => {
-    try {
-      const res = await fetch(`${baseUrl}/api/backtest`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
-      })
-      return await res.json()
-    } catch (e) {
-      console.error('runBacktest failed', e)
-      return null
-    }
-  }, [baseUrl])
+  async function runBacktest(params: Record<string, unknown>): Promise<any> {
+    return apiPost('/api/backtest', params)
+  }
 
-  return { saveConfig, triggerRefresh, runBacktest }
+  async function getSignals(): Promise<any> {
+    return apiGet('/api/signals')
+  }
+
+  return { saveConfig, triggerRefresh, runBacktest, getSignals }
 }
