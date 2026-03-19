@@ -31,7 +31,6 @@ interface SourceInfo {
 
 type ScheduleMap = Record<string, SourceInfo>
 
-// Source key → display order
 const SOURCE_ORDER = ['fx', 'cb_rates', 'gdp', 'fx_history', 'cpi', 'news', 'av']
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -109,13 +108,13 @@ function ApiDot({ status }: { status?: string }) {
   )
 }
 
-// ── Refresh status table (used in Scheduler view) ─────────────────────────────
+// ── Live source status table ───────────────────────────────────────────────────
 
 export function RefreshTable() {
-  const [schedule, setSchedule]       = useState<ScheduleMap | null>(null)
-  const [loading,  setLoading]        = useState(true)
-  const [refreshing, setRefreshing]   = useState<Record<string, boolean>>({})
-  const [ticks, setTicks]             = useState(0)
+  const [schedule, setSchedule]     = useState<ScheduleMap | null>(null)
+  const [loading,  setLoading]      = useState(true)
+  const [refreshing, setRefreshing] = useState<Record<string, boolean>>({})
+  const [, setTicks]                = useState(0)
   const tickRef = useRef<ReturnType<typeof setInterval>>()
 
   const loadSchedule = useCallback(async () => {
@@ -127,7 +126,7 @@ export function RefreshTable() {
   useEffect(() => {
     loadSchedule()
     const pollInterval = setInterval(loadSchedule, 10_000)
-    tickRef.current = setInterval(() => setTicks(t => t + 1), 1000)
+    tickRef.current   = setInterval(() => setTicks(t => t + 1), 1000)
     return () => {
       clearInterval(pollInterval)
       if (tickRef.current) clearInterval(tickRef.current)
@@ -145,15 +144,14 @@ export function RefreshTable() {
   }
 
   const handleRefreshAll = async () => {
-    const keys = SOURCE_ORDER
     const next: Record<string, boolean> = {}
-    keys.forEach(k => { next[k] = true })
+    SOURCE_ORDER.forEach(k => { next[k] = true })
     setRefreshing(next)
     await triggerRefresh()
     await loadSchedule()
     setTimeout(() => {
       const cleared: Record<string, boolean> = {}
-      keys.forEach(k => { cleared[k] = false })
+      SOURCE_ORDER.forEach(k => { cleared[k] = false })
       setRefreshing(cleared)
       loadSchedule()
     }, 3000)
@@ -181,7 +179,7 @@ export function RefreshTable() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <span style={{ fontSize: '9px', color: 'var(--text-faint)', letterSpacing: '0.04em' }}>
-          Auto-polls every 10 s · Countdown is live
+          Each source has its own automatic interval · Countdown is live
         </span>
         <button
           className={s.btnRefreshAll}
@@ -208,20 +206,17 @@ export function RefreshTable() {
           const info = schedule[key]
           if (!info) return null
 
-          const liveSecs = Math.max(0, info.next_call_ts - now)
+          const liveSecs    = Math.max(0, info.next_call_ts - now)
           const isRefreshing = !!refreshing[key]
 
           let statusLabel = 'NEVER'
           let statusCls   = s.statusNever
           if (info.force_pending) {
-            statusLabel = 'PENDING'
-            statusCls   = s.statusPending
+            statusLabel = 'PENDING'; statusCls = s.statusPending
           } else if (info.is_fresh) {
-            statusLabel = 'FRESH'
-            statusCls   = s.statusFresh
+            statusLabel = 'FRESH';   statusCls = s.statusFresh
           } else if (info.last_called_ts) {
-            statusLabel = 'STALE'
-            statusCls   = s.statusStale
+            statusLabel = 'STALE';   statusCls = s.statusStale
           }
 
           return (
@@ -232,9 +227,7 @@ export function RefreshTable() {
                 <span className={s.scheduleNote}>{info.note}</span>
               </span>
 
-              <span className={`${s.statusBadge} ${statusCls}`}>
-                {statusLabel}
-              </span>
+              <span className={`${s.statusBadge} ${statusCls}`}>{statusLabel}</span>
 
               <span className={s.scheduleCell} style={{ fontFamily: 'var(--font-mono)' }}>
                 {fmtTs(info.last_called_ts)}
@@ -295,9 +288,9 @@ interface Props {
 }
 
 export default function ConfigView({ config, apiStatus, onSave }: Props) {
-  const [local, setLocal]   = useState<Record<string, any>>({ ...config })
-  const [saved, setSaved]   = useState(false)
-  const [activeTab, setActiveTab] = useState<'api' | 'strategy' | 'weights' | 'pairs'>('api')
+  const [local, setLocal]         = useState<Record<string, any>>({ ...config })
+  const [saved, setSaved]         = useState(false)
+  const [activeTab, setActiveTab] = useState<'api' | 'strategy' | 'sources' | 'weights' | 'pairs'>('api')
 
   const set = (key: string, val: any) =>
     setLocal(prev => ({ ...prev, [key]: val }))
@@ -331,6 +324,7 @@ export default function ConfigView({ config, apiStatus, onSave }: Props) {
   const tabs: { id: typeof activeTab; label: string }[] = [
     { id: 'api',      label: '🔑 API Keys' },
     { id: 'strategy', label: '🎯 Strategy' },
+    { id: 'sources',  label: '📡 Data Sources' },
     { id: 'weights',  label: '⚖️ Weights' },
     { id: 'pairs',    label: '💱 Pairs' },
   ]
@@ -440,6 +434,23 @@ export default function ConfigView({ config, apiStatus, onSave }: Props) {
               <Toggle value={!!local.use_trend_confirm} onChange={v => set('use_trend_confirm', v)} label="Trend confirmation (AV)" />
               <Toggle value={!!local.use_regime_filter} onChange={v => set('use_regime_filter', v)} label="Market regime filter" />
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Tab: Data Sources (live scheduler status) ─────────────────────── */}
+      {activeTab === 'sources' && (
+        <div className={s.section}>
+          <div className={s.sectionHeader}>
+            <span className={s.sectionIcon}>📡</span>
+            <span className={s.sectionTitle}>Data Sources — Live Status</span>
+          </div>
+          <div className={s.sectionBody}>
+            <p style={{ fontSize: '9px', color: 'var(--text-secondary)', marginBottom: 12, maxWidth: 560, lineHeight: 1.6 }}>
+              Each source fetches on its own automatic schedule based on API rate limits.
+              Use the <strong style={{ color: 'var(--accent)' }}>↺</strong> buttons to force an immediate refresh of any source.
+            </p>
+            <RefreshTable />
           </div>
         </div>
       )}
