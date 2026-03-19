@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import React, { useState } from 'react'
 import { MacroState, FACTORS, FLAGS, provenanceBadge } from '../../types'
 import styles from './HeatmapView.module.css'
 
@@ -10,7 +10,6 @@ const FACTOR_LABELS = [
   'CONF','CPI','PPI','PCE','RATES','NFP','URATE','CLAIMS','ADP','JOLTS','NEWS'
 ]
 
-// ── Which data source drives each factor column ───────────────────────────────
 const FACTOR_SOURCE_MAP: Record<string, string> = {
   trend: 'av', season: '', cot: '', crowd: '', gdp: 'gdp',
   mpmi: '', spmi: '', retail: '', conf: '',
@@ -18,6 +17,16 @@ const FACTOR_SOURCE_MAP: Record<string, string> = {
   rates: 'cb_rates',
   nfp: 'cpi', urate: 'cpi', claims: 'cpi', adp: 'cpi', jolts: 'cpi',
   news: 'news',
+}
+
+const ERROR_TYPE_LABELS: Record<string, string> = {
+  NO_KEY:        'No API key — add in Config',
+  RATE_LIMIT:    'API rate limit reached',
+  HTTP_ERROR:    'HTTP error from API',
+  TIMEOUT:       'Request timed out',
+  PARSE_ERROR:   'Could not parse API response',
+  NETWORK:       'Network / connection error',
+  EMPTY_RESPONSE:'API returned empty data',
 }
 
 function cellClass(v: number | null | undefined): string {
@@ -43,17 +52,6 @@ function scoreColor(s: number, comp: number): string {
   return 'var(--red)'
 }
 
-// ── Error type labels for tooltips ────────────────────────────────────────────
-const ERROR_TYPE_LABELS: Record<string, string> = {
-  NO_KEY:        'No API key — add in Config',
-  RATE_LIMIT:    'API rate limit reached',
-  HTTP_ERROR:    'HTTP error from API',
-  TIMEOUT:       'Request timed out',
-  PARSE_ERROR:   'Could not parse API response',
-  NETWORK:       'Network / connection error',
-  EMPTY_RESPONSE:'API returned empty data',
-}
-
 function errorLabel(errObj: any): string {
   if (!errObj) return ''
   const typeLabel = ERROR_TYPE_LABELS[errObj.error_type] ?? errObj.error_type
@@ -61,38 +59,12 @@ function errorLabel(errObj: any): string {
   return `${typeLabel}${code}: ${errObj.error ?? ''}`
 }
 
-// ── Per-row warning: which factors are missing and why ───────────────────────
-function MissingFactorBadge({ factor, provenance, apiErrors }: {
-  factor: string
-  provenance: Record<string, any>
-  apiErrors: Record<string, any>
-}) {
-  const src = FACTOR_SOURCE_MAP[factor]
-  if (!src) return null
-  const prov = provenance[src]
-  const err  = apiErrors?.[src]
-  if (!prov || prov.source === 'live') return null
-
-  const tip = err ? errorLabel(err) : prov.source === 'no_key' ? 'No API key' : 'Not available'
-  const color = prov.source === 'no_key' ? 'var(--text-faint)' : 'var(--red)'
-
-  return (
-    <span
-      title={tip}
-      style={{ color, fontSize: '8px', fontWeight: 700, marginLeft: 2, cursor: 'help' }}
-    >
-      {prov.source === 'no_key' ? '○' : '✕'}
-    </span>
-  )
-}
-
 export default function HeatmapView({ state }: Props) {
   const [filter, setFilter] = useState<Filter>('all')
   const [search, setSearch] = useState('')
   const [expandedRow, setExpandedRow] = useState<string | null>(null)
 
-  const waiting = state.ts === 0
-
+  const waiting    = state.ts === 0
   const provenance = state.provenance ?? {}
   const apiErrors  = (state as any).api_errors ?? {}
 
@@ -112,16 +84,14 @@ export default function HeatmapView({ state }: Props) {
   const neuts = state.currencies.filter(c => c.bias === 'Neutral').length
   const insuf = state.currencies.filter(c => c.bias === 'Insufficient').length
 
-  // ── Status banner classification ────────────────────────────────────────
-  const errorKeys  = Object.entries(provenance).filter(([, p]: any) => p.source === 'error').map(([k]) => k)
-  const noKeyKeys  = Object.entries(provenance).filter(([, p]: any) => p.source === 'no_key').map(([k]) => k)
-  // 'static' source is no longer emitted by the backend — left here as safety guard
-  const staleKeys  = Object.entries(provenance).filter(([, p]: any) => p.source === 'static').map(([k]) => k)
+  const errorKeys = Object.entries(provenance).filter(([, p]: any) => p.source === 'error').map(([k]) => k)
+  const noKeyKeys = Object.entries(provenance).filter(([, p]: any) => p.source === 'no_key').map(([k]) => k)
+  const staleKeys = Object.entries(provenance).filter(([, p]: any) => p.source === 'static').map(([k]) => k)
 
   return (
     <div className={styles.wrap}>
 
-      {/* ── Status banner ─────────────────────────────────────────────── */}
+      {/* Status banner */}
       {!waiting && (staleKeys.length > 0 || errorKeys.length > 0 || noKeyKeys.length > 0) && (
         <div style={{
           padding: '6px 12px', marginBottom: '8px',
@@ -165,7 +135,7 @@ export default function HeatmapView({ state }: Props) {
         </div>
       )}
 
-      {/* ── Header ────────────────────────────────────────────────────── */}
+      {/* Header */}
       <div className={styles.header}>
         <div className={styles.headerLeft}>
           <span className={styles.title}>CURRENCY STRENGTH MATRIX</span>
@@ -179,7 +149,7 @@ export default function HeatmapView({ state }: Props) {
         </div>
       </div>
 
-      {/* ── Controls ──────────────────────────────────────────────────── */}
+      {/* Controls */}
       <div className={styles.controls}>
         <div className={styles.filters}>
           {(['all','bull','bear','neut','insuf'] as Filter[]).map(f => (
@@ -200,14 +170,14 @@ export default function HeatmapView({ state }: Props) {
         />
       </div>
 
-      {/* ── Loading state ─────────────────────────────────────────────── */}
+      {/* Loading */}
       {waiting && (
         <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-secondary)', fontSize: '11px' }}>
           ⟳ CONNECTING TO BACKEND…
         </div>
       )}
 
-      {/* ── Table ─────────────────────────────────────────────────────── */}
+      {/* Table */}
       {!waiting && (
         <div className={styles.tableWrap}>
           <table>
@@ -227,9 +197,9 @@ export default function HeatmapView({ state }: Props) {
                 const hasMissing = (row as any).missing_factors?.length > 0
                 const isExpanded = expandedRow === row.code
                 return (
-                  <>
+                  // KEY must be on React.Fragment, not bare <> — that was the warning
+                  <React.Fragment key={row.code}>
                     <tr
-                      key={row.code}
                       style={hasMissing ? { borderLeft: '2px solid rgba(255,140,0,0.45)' } : undefined}
                       onClick={() => hasMissing ? setExpandedRow(isExpanded ? null : row.code) : undefined}
                       title={hasMissing ? 'Click to see missing factors' : undefined}
@@ -253,9 +223,9 @@ export default function HeatmapView({ state }: Props) {
                         }
                       </td>
                       <td>
-                        <span style={{ fontWeight: 700, color: scoreColor(row.score, row.completeness) }}>
+                        <span style={{ fontWeight: 700, color: scoreColor(row.score ?? 0, row.completeness) }}>
                           {row.completeness >= 5
-                            ? ((row as any).is_partial ? '~' : '') + (row.score >= 0 ? '+' : '') + row.score.toFixed(1)
+                            ? ((row as any).is_partial ? '~' : '') + ((row.score ?? 0) >= 0 ? '+' : '') + (row.score ?? 0).toFixed(1)
                             : '—'
                           }
                         </span>
@@ -269,8 +239,8 @@ export default function HeatmapView({ state }: Props) {
                         }}>{row.completeness}/19</span>
                       </td>
                       {FACTORS.map(f => {
-                        const v   = (row.factors as any)[f]
-                        const src = FACTOR_SOURCE_MAP[f]
+                        const v    = (row.factors as any)[f]
+                        const src  = FACTOR_SOURCE_MAP[f]
                         const prov = src ? provenance[src] : null
                         const err  = src ? apiErrors[src]  : null
                         const isErr = prov && prov.source !== 'live' && prov.source !== 'pending'
@@ -296,16 +266,16 @@ export default function HeatmapView({ state }: Props) {
                       })}
                     </tr>
 
-                    {/* ── Expanded missing-factor detail row ──────────── */}
+                    {/* Expanded missing-factor row */}
                     {isExpanded && hasMissing && (
-                      <tr key={`${row.code}-detail`} style={{ background: 'rgba(255,100,0,0.04)' }}>
+                      <tr style={{ background: 'rgba(255,100,0,0.04)' }}>
                         <td colSpan={23} style={{ padding: '6px 12px 8px 24px', fontSize: '9px', color: 'var(--text-secondary)' }}>
                           <span style={{ color: 'rgba(255,140,0,0.8)', fontWeight: 700 }}>MISSING FACTORS FOR {row.code}: </span>
                           {(row as any).missing_factors?.map((f: string) => {
-                            const src = FACTOR_SOURCE_MAP[f]
-                            const err = src ? apiErrors[src] : null
+                            const src  = FACTOR_SOURCE_MAP[f]
+                            const err  = src ? apiErrors[src] : null
                             const prov = src ? provenance[src] : null
-                            const why = err ? errorLabel(err)
+                            const why  = err ? errorLabel(err)
                                        : prov?.source === 'no_key' ? 'No API key'
                                        : prov?.source === 'error'  ? 'Fetch error'
                                        : 'Not available'
@@ -319,7 +289,7 @@ export default function HeatmapView({ state }: Props) {
                         </td>
                       </tr>
                     )}
-                  </>
+                  </React.Fragment>
                 )
               })}
             </tbody>
@@ -327,7 +297,7 @@ export default function HeatmapView({ state }: Props) {
         </div>
       )}
 
-      {/* ── Pair signal cards ─────────────────────────────────────────── */}
+      {/* Pair signal cards */}
       <div className={styles.pairsHeader}>
         <span className={styles.title}>ACTIVE PAIR SIGNALS</span>
         <span className={styles.sub}>CMSI DIFFERENTIAL · THRESHOLD ±{state.config?.signal_threshold ?? 3}</span>
@@ -352,29 +322,29 @@ export default function HeatmapView({ state }: Props) {
               <div className={styles.cardHeader}>
                 <span className={styles.cardPair}>{sig.pair}</span>
                 <span className={styles.cardDiff} style={{ color: isLong ? 'var(--green)' : 'var(--red)' }}>
-                  {sig.diff >= 0 ? '+' : ''}{sig.diff.toFixed(1)}
+                  {(sig.diff ?? 0) >= 0 ? '+' : ''}{(sig.diff ?? 0).toFixed(1)}
                 </span>
               </div>
               <div className={styles.cardBars}>
                 <div className={styles.barRow}>
                   <span className={styles.barLabel} style={{ color: 'var(--green)' }}>{sig.pair.slice(0,3)}</span>
                   <div className={styles.barTrack}>
-                    <div className={styles.barFill} style={{ width: `${Math.max(0,(sig.base_score+6)/12*100).toFixed(0)}%`, background: 'var(--green)' }} />
+                    <div className={styles.barFill} style={{ width: `${Math.max(0,((sig.base_score ?? 0)+6)/12*100).toFixed(0)}%`, background: 'var(--green)' }} />
                   </div>
-                  <span className={styles.barScore} style={{ color: 'var(--green)' }}>{sig.base_score.toFixed(1)}</span>
+                  <span className={styles.barScore} style={{ color: 'var(--green)' }}>{(sig.base_score ?? 0).toFixed(1)}</span>
                 </div>
                 <div className={styles.barRow}>
                   <span className={styles.barLabel} style={{ color: 'var(--red)' }}>{sig.pair.slice(3)}</span>
                   <div className={styles.barTrack}>
-                    <div className={styles.barFill} style={{ width: `${Math.max(0,(sig.quote_score+6)/12*100).toFixed(0)}%`, background: 'var(--red)' }} />
+                    <div className={styles.barFill} style={{ width: `${Math.max(0,((sig.quote_score ?? 0)+6)/12*100).toFixed(0)}%`, background: 'var(--red)' }} />
                   </div>
-                  <span className={styles.barScore} style={{ color: 'var(--red)' }}>{sig.quote_score.toFixed(1)}</span>
+                  <span className={styles.barScore} style={{ color: 'var(--red)' }}>{(sig.quote_score ?? 0).toFixed(1)}</span>
                 </div>
               </div>
               <div className={styles.cardCarry}>
                 <span style={{ color: 'var(--text-faint)', fontSize: '8px' }}>CARRY</span>
-                <span style={{ color: sig.carry >= 0 ? 'var(--green)' : 'var(--red)', fontSize: '10px' }}>
-                  {sig.carry >= 0 ? '+' : ''}{sig.carry.toFixed(2)}%
+                <span style={{ color: (sig.carry ?? 0) >= 0 ? 'var(--green)' : 'var(--red)', fontSize: '10px' }}>
+                  {(sig.carry ?? 0) >= 0 ? '+' : ''}{(sig.carry ?? 0).toFixed(2)}%
                 </span>
               </div>
               <div className={styles.cardSignal} style={{ color: isLong ? 'var(--green)' : 'var(--red)' }}>
@@ -393,12 +363,9 @@ export default function HeatmapView({ state }: Props) {
                   </span>
                 ) : (
                   <>
-                    <span className={styles.cardPrice}>{sig.entry.toFixed(4)}</span>
+                    <span className={styles.cardPrice}>{(sig.entry ?? 0).toFixed(4)}</span>
                     {!fxLive && (
-                      <span
-                        style={{ color: 'var(--yellow)', fontSize: '8px' }}
-                        title="FX rate data not confirmed live"
-                      >~</span>
+                      <span style={{ color: 'var(--yellow)', fontSize: '8px' }} title="FX rate data not confirmed live">~</span>
                     )}
                   </>
                 )}

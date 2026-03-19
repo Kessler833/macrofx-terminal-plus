@@ -18,7 +18,7 @@ from .backtest     import run_backtest
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 logger = logging.getLogger("macrofx.server")
 
-app = FastAPI(title="MacroFX Terminal Plus", version="1.1.0")
+app = FastAPI(title="MacroFX Terminal Plus", version="1.1.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 cfg             = cfg_load()
@@ -27,22 +27,18 @@ clients:         Set[WebSocket] = set()
 last_state:      dict = {}
 trend_overrides: dict = {}
 
-# Default refresh: 15 min. User can override in Config via refresh_interval_s.
 DEFAULT_REFRESH_S = 900
 
 
 def build_state() -> dict:
-    month = date.today().month - 1  # 0-indexed
+    month = date.today().month - 1
 
-    # ── Data: use only what is actually in the live caches ───────────────
-    # If a cache is empty (fetch failed), pass an empty dict to the engine.
-    # The engine will leave those factor scores as None → frontend shows error.
     factor_data = build_factor_data(
         month        = month,
-        cb_rates     = fetcher.cb_rates,    # {} if not yet fetched live
-        gdp_vals     = fetcher.gdp_vals,    # {} if not yet fetched live
-        cpi_changes  = fetcher.cpi_changes, # {} if not yet fetched live
-        news_scores  = fetcher.news_scores, # {} if not yet fetched live
+        cb_rates     = fetcher.cb_rates,
+        gdp_vals     = fetcher.gdp_vals,
+        cpi_changes  = fetcher.cpi_changes,
+        news_scores  = fetcher.news_scores,
         pmi_data     = None,
         cot_data     = None,
         crowd_data   = None,
@@ -70,28 +66,25 @@ def build_state() -> dict:
         fs    = factor_data.get(cur)
         score = cmsi.get(cur, 0.0)
         comp  = completeness.get(cur, 0)
-        # Mark partial score with is_partial flag so frontend can show ~
-        available_factors = [f for f in FACTORS if fs and getattr(fs, f) is not None]
         currencies_data.append({
-            "code":             cur,
-            "score":            score,
-            "bias":             get_bias(score, comp),
-            "factors":          fs.to_dict() if fs else {},
-            "completeness":     comp,
-            "is_partial":       comp < len(FACTORS),
-            "missing_factors":  [f for f in FACTORS if fs and getattr(fs, f) is None],
+            "code":            cur,
+            "score":           score,
+            "bias":            get_bias(score, comp),
+            "factors":         fs.to_dict() if fs else {},
+            "completeness":    comp,
+            "is_partial":      comp < len(FACTORS),
+            "missing_factors": [f for f in FACTORS if fs and getattr(fs, f) is None],
         })
 
-    # CB rates table — only populated from live fetches
     cb_table = []
     max_rate = max(fetcher.cb_rates.values()) if fetcher.cb_rates else None
     for cur in CURRENCIES:
-        r    = fetcher.cb_rates.get(cur)       # None if not fetched
+        r    = fetcher.cb_rates.get(cur)
         meta = fetcher.cb_meta.get(cur, {})
         cb_table.append({
             "currency": cur,
             "bank":     meta.get("bank",   ""),
-            "rate":     r,                      # None = no data
+            "rate":     r,
             "change":   meta.get("change", None),
             "next_mtg": meta.get("next",   "—"),
             "stance":   meta.get("stance", None),
@@ -123,30 +116,28 @@ def build_state() -> dict:
     carry_fav = (
         (fetcher.cb_rates.get("AUD", 0) - fetcher.cb_rates.get("JPY", 0)) > 3
         if "AUD" in fetcher.cb_rates and "JPY" in fetcher.cb_rates
-        else None  # unknown if rates not loaded
+        else None
     )
 
     corr = fetcher.compute_correlation_matrix()
-
-    # ── Full provenance including structured errors ───────────────────────
     provenance = fetcher.get_data_provenance()
 
     return {
-        "ts":              int(time.time()),
-        "currencies":      currencies_data,
-        "signals":         signals,
-        "cb_rates":        cb_table,
-        "rate_diffs":      rate_diffs,
-        "correlation":     corr,
-        "regime":          regime,
-        "carry_env":       ("FAVORABLE (AUD/JPY+)" if carry_fav else "CAUTIOUS") if carry_fav is not None else "UNKNOWN",
-        "top_spread_pair": top_pair,
-        "dxy_score":       cmsi.get("USD", None),
-        "api_status":      fetcher.api_status,
-        "api_errors":      fetcher.api_errors,   # NEW: structured error details
-        "data_sources":    fetcher.data_sources,
-        "provenance":      provenance,
-        "config":          cfg,
+        "ts":               int(time.time()),
+        "currencies":       currencies_data,
+        "signals":          signals,
+        "cb_rates":         cb_table,
+        "rate_diffs":       rate_diffs,
+        "correlation":      corr,
+        "regime":           regime,
+        "carry_env":        ("FAVORABLE (AUD/JPY+)" if carry_fav else "CAUTIOUS") if carry_fav is not None else "UNKNOWN",
+        "top_spread_pair":  top_pair,
+        "dxy_score":        cmsi.get("USD", None),
+        "api_status":       fetcher.api_status,
+        "api_errors":       fetcher.api_errors,
+        "data_sources":     fetcher.data_sources,
+        "provenance":       provenance,
+        "config":           cfg,
         "refresh_interval_s": cfg.get("refresh_interval_s", DEFAULT_REFRESH_S),
     }
 
@@ -214,14 +205,48 @@ class ConfigUpdate(BaseModel):
 @app.post("/config")
 @app.post("/api/config")
 async def update_config(body: ConfigUpdate):
-    global cfg, fetcher
+    global cfg, fetcher, last_state
     cfg.update(body.data)
     cfg_save(cfg)
     fetcher.cfg = cfg
-    logger.info("[config] Updated and saved — refresh_interval_s=%s",
-                cfg.get('refresh_interval_s', DEFAULT_REFRESH_S))
-    asyncio.create_task(fetcher.refresh_all(trend_overrides))
+
+    # If a new AV key was provided, immediately mark it as 'pending' so the
+    # frontend shows a spinner rather than staying on the old stale status.
+    # The real ok/error result arrives after refresh_all completes.
+    new_av_key = body.data.get("alpha_vantage_key", "").strip()
+    if new_av_key:
+        fetcher.api_status["av"]  = "pending"
+        fetcher.api_errors.pop("av", None)
+        logger.info("[config] Alpha Vantage key updated — status reset to pending")
+
+    # Same treatment for FRED key
+    new_fred_key = body.data.get("fred_key", "").strip()
+    if new_fred_key:
+        fetcher.api_status["fred"] = "pending"
+        fetcher.api_errors.pop("fred", None)
+        logger.info("[config] FRED key updated — status reset to pending")
+
+    # Broadcast immediately so the frontend sees 'pending' right away,
+    # then kick off the background refresh that will resolve it to ok/error.
+    last_state = build_state()
+    await broadcast(last_state)
+
+    logger.info("[config] Updated and saved — triggering background refresh")
+    asyncio.create_task(_refresh_and_broadcast())
     return {"ok": True}
+
+
+async def _refresh_and_broadcast():
+    """Run a full refresh cycle and push the result to all WS clients."""
+    global last_state
+    try:
+        await fetcher.refresh_all(trend_overrides)
+        last_state = build_state()
+        await broadcast(last_state)
+        logger.info("[config/refresh] Post-config refresh complete — av=%s fred=%s",
+                    fetcher.api_status.get('av'), fetcher.api_status.get('fred'))
+    except Exception as e:
+        logger.exception("[config/refresh] Error: %s", e)
 
 
 class BacktestRequest(BaseModel):
@@ -252,7 +277,7 @@ async def run_backtest_endpoint(req: BacktestRequest):
 @app.post("/api/refresh")
 @app.get("/api/refresh")
 async def manual_refresh():
-    asyncio.create_task(fetcher.refresh_all(trend_overrides))
+    asyncio.create_task(_refresh_and_broadcast())
     return {"ok": True, "message": "Refresh triggered"}
 
 
