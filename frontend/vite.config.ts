@@ -5,5 +5,9 @@ export default defineConfig({
   plugins: [react()],
   base: './',
   build: { outDir: 'dist', emptyOutDir: true },
-  server: { port: 5173, strictPort: true },
+  server: {
+    port: 5173,
+    strictPort: false,   // try next available port instead of crashing
+    host: 'localhost',
+  },
 })
