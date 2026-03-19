@@ -16,8 +16,8 @@ export type ViewId = 'heatmap' | 'signals' | 'macro' | 'backtest' | 'config' | '
 
 export default function App() {
   const [activeView, setActiveView] = useState<ViewId>('heatmap')
-  const { state, connected } = useMacroWS('ws://127.0.0.1:8766/ws')
-  const { saveConfig, triggerRefresh, runBacktest } = useApi('http://127.0.0.1:8766')
+  const { state, connected } = useMacroWS()
+  const { saveConfig, triggerRefresh } = useApi('http://127.0.0.1:8766')
 
   const cfg       = state?.config     ?? {}
   const apiStatus = state?.api_status ?? {}
@@ -31,7 +31,7 @@ export default function App() {
           {activeView === 'heatmap'  && <HeatmapView  state={state} />}
           {activeView === 'signals'  && <SignalsView  state={state} />}
           {activeView === 'macro'    && <MacroView    state={state} />}
-          {activeView === 'backtest' && <BacktestView runBacktest={runBacktest} activePairs={cfg.active_pairs ?? []} />}
+          {activeView === 'backtest' && <BacktestView state={state} activePairs={cfg.active_pairs ?? []} />}
           {activeView === 'config'   && <ConfigView   config={cfg} apiStatus={apiStatus} onSave={saveConfig} />}
           {activeView === 'about'    && <AboutView    apiStatus={apiStatus} />}
         </main>

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState } from 'react'
 import { MacroState, BacktestResult } from '../../types'
 import { apiPost } from '../../hooks/useMacroWS'
 import styles from './BacktestView.module.css'
@@ -11,26 +11,30 @@ import { Line } from 'react-chartjs-2'
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Legend, Filler)
 
-interface Props { state: MacroState }
+interface Props {
+  state: MacroState | null
+  runBacktest?: (params: Record<string, any>) => Promise<any>
+  activePairs?: string[]
+}
 
 const MONTH_LABELS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 
-export default function BacktestView({ state }: Props) {
-  const pairs = (state.config?.active_pairs as string[] | undefined) ?? ['AUDJPY','EURUSD','USDJPY']
+export default function BacktestView({ state, activePairs }: Props) {
+  const pairs = activePairs?.length ? activePairs : (state?.config?.active_pairs as string[] | undefined) ?? ['AUDJPY','EURUSD','USDJPY']
   const [pair, setPair]   = useState(pairs[0] || 'AUDJPY')
   const [strat, setStrat] = useState('cmsi')
   const [from, setFrom]   = useState('2013-01-01')
   const [to, setTo]       = useState('2025-12-31')
   const [cap, setCap]     = useState('10000')
   const [pos, setPos]     = useState('10')
-  const [thr, setThr]     = useState(String(state.config?.signal_threshold ?? 3))
+  const [thr, setThr]     = useState(String(state?.config?.signal_threshold ?? 3))
   const [running, setRunning] = useState(false)
   const [result, setResult]   = useState<BacktestResult | null>(null)
 
-  async function runBacktest() {
+  async function doRunBacktest() {
     setRunning(true)
     setResult(null)
-    const res = await apiPost('/backtest', {
+    const res = await apiPost('/api/backtest', {
       pair, strategy: strat,
       start: from, end: to,
       capital: parseFloat(cap),
@@ -42,17 +46,17 @@ export default function BacktestView({ state }: Props) {
   }
 
   const chartData = result ? {
-    labels: result.equity_curve.map(p => p.t),
+    labels: result.equity_curve.map((p: any) => p.t),
     datasets: [
       {
         label: 'Strategy',
-        data: result.equity_curve.map(p => p.v),
+        data: result.equity_curve.map((p: any) => p.v),
         borderColor: '#6c63ff', borderWidth: 1.5,
         pointRadius: 0, fill: false, tension: 0.1,
       },
       {
         label: 'Buy & Hold',
-        data: result.hodl_curve.map(p => p.v),
+        data: result.hodl_curve.map((p: any) => p.v),
         borderColor: '#00ccff', borderWidth: 1.5,
         pointRadius: 0, fill: false, tension: 0.1,
         borderDash: [4, 4],
@@ -76,7 +80,6 @@ export default function BacktestView({ state }: Props) {
 
   return (
     <div className={styles.wrap}>
-      {/* Parameters */}
       <div className="panel">
         <div className="panel-title">BACKTEST PARAMETERS</div>
         <div className={styles.paramGrid}>
@@ -114,8 +117,8 @@ export default function BacktestView({ state }: Props) {
             <input type="number" value={thr} step="0.5" onChange={e => setThr(e.target.value)} />
           </div>
           <div className={styles.paramItem} style={{ alignSelf: 'end' }}>
-            <button className="btn btn-primary" onClick={runBacktest} disabled={running}>
-              {running ? '⟳ RUNNING…' : '▶ RUN BACKTEST'}
+            <button className="btn btn-primary" onClick={doRunBacktest} disabled={running}>
+              {running ? '\u27f3 RUNNING\u2026' : '\u25b6 RUN BACKTEST'}
             </button>
           </div>
         </div>
@@ -123,7 +126,6 @@ export default function BacktestView({ state }: Props) {
 
       {result && !result.error && (
         <>
-          {/* Stats */}
           <div className={styles.statsGrid}>
             {[
               { label: 'TOTAL RETURN', val: `${result.total_return >= 0 ? '+' : ''}${result.total_return.toFixed(1)}%`, pos: result.total_return >= 0 },
@@ -143,17 +145,15 @@ export default function BacktestView({ state }: Props) {
             ))}
           </div>
 
-          {/* Equity curve */}
           <div className="panel">
-            <div className="panel-title">EQUITY CURVE — STRATEGY vs BUY & HOLD</div>
+            <div className="panel-title">EQUITY CURVE</div>
             <div className={styles.chartWrap}>
               {chartData && <Line data={chartData} options={chartOptions as any} />}
             </div>
           </div>
 
-          {/* Monthly returns */}
           <div className="panel">
-            <div className="panel-title">MONTHLY RETURNS HEATMAP (%)</div>
+            <div className="panel-title">MONTHLY RETURNS (%)</div>
             <div className={styles.monthlyWrap}>
               <table>
                 <thead>
@@ -166,7 +166,7 @@ export default function BacktestView({ state }: Props) {
                 <tbody>
                   {allYears.map(yr => {
                     const mdata = result.monthly_returns[yr] || {}
-                    const annual = Object.values(mdata).reduce((s, v) => s + v, 0)
+                    const annual = Object.values(mdata).reduce((s: number, v: any) => s + v, 0) as number
                     return (
                       <tr key={yr}>
                         <td style={{ fontWeight: 700 }}>{yr}</td>
@@ -178,7 +178,7 @@ export default function BacktestView({ state }: Props) {
                             : v > -1 ? 'rgba(255,68,102,0.08)' : v > -3 ? 'rgba(255,68,102,0.2)' : 'rgba(255,68,102,0.4)'
                           return (
                             <td key={m} style={{ background: bg, textAlign: 'center', color: v === undefined ? 'var(--text-faint)' : v >= 0 ? 'var(--green)' : 'var(--red)', fontSize: '10px' }}>
-                              {v !== undefined ? (v >= 0 ? '+' : '') + v.toFixed(1) : '—'}
+                              {v !== undefined ? (v >= 0 ? '+' : '') + v.toFixed(1) : '\u2014'}
                             </td>
                           )
                         })}
@@ -193,36 +193,27 @@ export default function BacktestView({ state }: Props) {
             </div>
           </div>
 
-          {/* Trade log */}
           <div className="panel">
-            <div className="panel-title">TRADE LOG — LAST {result.trades.length} TRADES</div>
+            <div className="panel-title">TRADE LOG</div>
             <div className={styles.tradeWrap}>
               <table>
                 <thead>
-                  <tr>
-                    <th>#</th><th>PAIR</th><th>DIR</th><th>ENTRY DATE</th><th>EXIT DATE</th>
-                    <th>DAYS</th><th>ENTRY</th><th>EXIT</th><th>P&L ($)</th><th>P&L (%)</th>
-                    <th>CMSI@ENTRY</th><th>EXIT REASON</th>
-                  </tr>
+                  <tr><th>#</th><th>PAIR</th><th>DIR</th><th>ENTRY</th><th>EXIT</th><th>DAYS</th><th>ENTRY PX</th><th>EXIT PX</th><th>P&L ($)</th><th>P&L (%)</th><th>CMSI</th><th>REASON</th></tr>
                 </thead>
                 <tbody>
-                  {result.trades.map(t => (
+                  {result.trades.map((t: any) => (
                     <tr key={t.n}>
                       <td style={{ color: 'var(--text-faint)' }}>{t.n}</td>
                       <td style={{ fontWeight: 700 }}>{t.pair}</td>
-                      <td><span className={t.dir === 'LONG' ? 'dir-long' : 'dir-short'}>{t.dir === 'LONG' ? '▲' : '▼'} {t.dir}</span></td>
-                      <td style={{ color: 'var(--text-secondary)' }}>{t.entry_date}</td>
-                      <td style={{ color: 'var(--text-secondary)' }}>{t.exit_date}</td>
+                      <td><span style={{ color: t.dir === 'LONG' ? 'var(--green)' : 'var(--red)' }}>{t.dir === 'LONG' ? '\u25b2' : '\u25bc'} {t.dir}</span></td>
+                      <td>{t.entry_date}</td>
+                      <td>{t.exit_date}</td>
                       <td>{t.days}</td>
-                      <td>{t.entry.toFixed(4)}</td>
-                      <td>{t.exit.toFixed(4)}</td>
-                      <td style={{ color: t.pnl_usd >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>
-                        {t.pnl_usd >= 0 ? '+' : ''}{t.pnl_usd.toFixed(2)}
-                      </td>
-                      <td style={{ color: t.pnl_pct >= 0 ? 'var(--green)' : 'var(--red)' }}>
-                        {t.pnl_pct >= 0 ? '+' : ''}{t.pnl_pct.toFixed(2)}%
-                      </td>
-                      <td style={{ color: 'var(--accent)' }}>{t.cmsi_at_entry.toFixed(1)}</td>
+                      <td>{t.entry?.toFixed(4)}</td>
+                      <td>{t.exit?.toFixed(4)}</td>
+                      <td style={{ color: t.pnl_usd >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>{t.pnl_usd >= 0 ? '+' : ''}{t.pnl_usd?.toFixed(2)}</td>
+                      <td style={{ color: t.pnl_pct >= 0 ? 'var(--green)' : 'var(--red)' }}>{t.pnl_pct >= 0 ? '+' : ''}{t.pnl_pct?.toFixed(2)}%</td>
+                      <td style={{ color: 'var(--accent)' }}>{t.cmsi_at_entry?.toFixed(1)}</td>
                       <td style={{ fontSize: '9px', color: 'var(--text-secondary)' }}>{t.exit_reason}</td>
                     </tr>
                   ))}
@@ -233,13 +224,8 @@ export default function BacktestView({ state }: Props) {
         </>
       )}
 
-      {result?.error && (
-        <div className={styles.errorBox}>✕ {result.error}</div>
-      )}
-
-      {running && (
-        <div className={styles.loadingBox}>⟳ Running backtest simulation…</div>
-      )}
+      {result?.error && <div className={styles.errorBox}>\u2715 {result.error}</div>}
+      {running && <div className={styles.loadingBox}>\u27f3 Running backtest simulation\u2026</div>}
     </div>
   )
 }

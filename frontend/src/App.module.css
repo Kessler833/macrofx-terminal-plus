@@ -1,4 +1,4 @@
-.app {
+.root {
   display: flex;
   flex-direction: column;
   height: 100vh;
@@ -6,14 +6,25 @@
   overflow: hidden;
   background: var(--bg-primary);
 }
+
 .body {
   display: flex;
   flex: 1;
   overflow: hidden;
+  min-height: 0;
 }
+
 .main {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  background: var(--bg-primary);
+  background: var(--bg-secondary);
+  position: relative;
+  scroll-behavior: smooth;
 }
+
+/* Scrollbar styling */
+.main::-webkit-scrollbar { width: 6px; }
+.main::-webkit-scrollbar-track { background: var(--bg-primary); }
+.main::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 3px; }
+.main::-webkit-scrollbar-thumb:hover { background: var(--accent); }
