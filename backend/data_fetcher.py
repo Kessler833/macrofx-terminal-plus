@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio, logging, time
 from datetime import date, timedelta
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 import httpx
 
@@ -14,27 +14,9 @@ PAIRS_DEFAULT = [
     "AUDNZD","EURJPY","CADJPY","CHFJPY","EURCHF",
 ]
 
-# These are LABELLED as static so the frontend can show STALE badges.
-# They are NEVER silently presented as live data.
-# source tag: "static" | "live" | "error" | "no_key"
-CB_RATES_STATIC: Dict[str, float] = {
-    "USD": 4.375, "EUR": 2.50, "GBP": 4.50, "JPY": 0.50,
-    "AUD": 4.10,  "NZD": 3.75, "CAD": 2.75, "CHF": 0.25,
-}
-CB_META_STATIC = {
-    "USD": {"bank": "Federal Reserve",  "stance": "Neutral", "next": "07 May 2026", "change": -0.25},
-    "EUR": {"bank": "ECB",              "stance": "Dovish",  "next": "17 Apr 2026", "change": -0.25},
-    "GBP": {"bank": "Bank of England",  "stance": "Neutral", "next": "08 May 2026", "change":  0.00},
-    "JPY": {"bank": "Bank of Japan",    "stance": "Hawkish", "next": "30 Apr 2026", "change":  0.25},
-    "AUD": {"bank": "Reserve Bank AUS", "stance": "Dovish",  "next": "06 May 2026", "change": -0.25},
-    "NZD": {"bank": "RBNZ",             "stance": "Dovish",  "next": "28 May 2026", "change": -0.25},
-    "CAD": {"bank": "Bank of Canada",   "stance": "Dovish",  "next": "16 Apr 2026", "change": -0.25},
-    "CHF": {"bank": "Swiss Nat. Bank",  "stance": "Dovish",  "next": "19 Jun 2026", "change": -0.25},
-}
-GDP_STATIC: Dict[str, float] = {
-    "USD": 2.3, "EUR": 0.9, "GBP": 1.1, "JPY": 0.4,
-    "AUD": 1.8, "NZD": 1.2, "CAD": 1.5, "CHF": 1.4,
-}
+# NO static fallback data anywhere in this file.
+# If a fetch fails the cache stays empty and the frontend shows the error.
+# All error details are surfaced to the frontend via api_errors.
 
 
 class DataFetcher:
@@ -42,20 +24,18 @@ class DataFetcher:
         self.cfg = cfg
         self._client: Optional[httpx.AsyncClient] = None
 
-        # ── Data caches ──────────────────────────────────────────────────
-        # Each cache entry is the actual value (or None if not yet fetched).
-        # NEVER pre-populate with static data here — that hides failures.
+        # ── Data caches — empty until a successful live fetch ─────────────
         self.fx_rates:    Dict[str, float] = {}
         self.fx_history:  Dict[str, Dict[str, float]] = {}
-        self.cb_rates:    Dict[str, float] = {}   # empty until first live fetch
-        self.cb_meta:     dict = {}                # empty until first live fetch
-        self.gdp_vals:    Dict[str, float] = {}   # empty until first live fetch
+        self.cb_rates:    Dict[str, float] = {}
+        self.cb_meta:     dict = {}
+        self.gdp_vals:    Dict[str, float] = {}
         self.cpi_changes: Dict[str, float] = {}
         self.news_scores: Dict[str, int]   = {}
 
-        # ── Source tagging ───────────────────────────────────────────────
-        # Tracks where each data group last came from.
-        # Possible values: "live" | "static" | "error" | "no_key" | "pending"
+        # ── Source tagging ────────────────────────────────────────────────
+        # Values: "live" | "error" | "no_key" | "pending"
+        # NOTE: "static" is intentionally removed — there are no silent fallbacks.
         self.data_sources: Dict[str, str] = {
             "cb_rates": "pending",
             "gdp":      "pending",
@@ -65,15 +45,23 @@ class DataFetcher:
             "av":       "pending",
         }
 
-        # ── API status (shown in Config dots) ────────────────────────────
+        # ── API connection status (shown as dots in Config) ───────────────
         self.api_status: Dict[str, str] = {
-            "fx": "pending", "fred": "pending",
-            "worldbank": "pending", "news": "pending", "av": "pending",
+            "fx":        "pending",
+            "fred":      "pending",
+            "worldbank": "pending",
+            "news":      "pending",
+            "av":        "pending",
+            "ecb":       "pending",
         }
 
-        # ── Staleness timestamps ─────────────────────────────────────────
-        # Unix timestamp of when each group was last successfully fetched.
-        # 0 = never fetched live.
+        # ── Detailed error log — surfaced to the frontend ─────────────────
+        # Keyed by data group. Each value: {error, error_type, http_code, ts}
+        # error_type: "HTTP_ERROR" | "TIMEOUT" | "PARSE_ERROR" | "NO_KEY"
+        #             | "RATE_LIMIT" | "NETWORK" | "EMPTY_RESPONSE"
+        self.api_errors: Dict[str, Any] = {}
+
+        # ── Staleness timestamps (unix ts of last successful fetch) ────────
         self.fetch_ts: Dict[str, float] = {
             "cb_rates": 0, "gdp": 0, "cpi": 0,
             "fx": 0, "news": 0, "av": 0,
@@ -82,78 +70,90 @@ class DataFetcher:
     @property
     def client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=12.0, follow_redirects=True)
+            self._client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
         return self._client
 
     async def close(self):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
-    def _cb_rates_effective(self) -> Dict[str, float]:
-        """Return live cb_rates if available, else static fallback (marked as static)."""
-        if self.cb_rates:
-            return self.cb_rates
-        return CB_RATES_STATIC
-
-    def _cb_meta_effective(self) -> dict:
-        if self.cb_meta:
-            return self.cb_meta
-        return {k: dict(v) for k, v in CB_META_STATIC.items()}
-
-    def _gdp_effective(self) -> Dict[str, float]:
-        if self.gdp_vals:
-            return self.gdp_vals
-        return GDP_STATIC
+    def _record_error(self, group: str, exc: Exception, http_code: Optional[int] = None):
+        """Classify and store an error for the given data group."""
+        msg = str(exc)
+        if http_code == 429:
+            etype = "RATE_LIMIT"
+        elif http_code and http_code >= 400:
+            etype = "HTTP_ERROR"
+        elif isinstance(exc, httpx.TimeoutException):
+            etype = "TIMEOUT"
+        elif isinstance(exc, httpx.NetworkError):
+            etype = "NETWORK"
+        elif "parse" in msg.lower() or isinstance(exc, (KeyError, IndexError, ValueError)):
+            etype = "PARSE_ERROR"
+        else:
+            etype = "NETWORK"
+        self.api_errors[group] = {
+            "error":      msg[:200],
+            "error_type": etype,
+            "http_code":  http_code,
+            "ts":         int(time.time()),
+        }
+        logger.warning("[%s] %s: %s", group, etype, msg[:120])
 
     def get_data_provenance(self) -> Dict[str, dict]:
-        """Return provenance info for every data group: source + age_seconds."""
+        """Return provenance for every data group: source + age_seconds + error details."""
         now = time.time()
         result = {}
         for key, src in self.data_sources.items():
-            ts = self.fetch_ts.get(key, 0)
+            ts  = self.fetch_ts.get(key, 0)
+            err = self.api_errors.get(key)
             result[key] = {
                 "source": src,
-                "age_s": int(now - ts) if ts > 0 else None,
+                "age_s":  int(now - ts) if ts > 0 else None,
+                "error":  err,  # None when healthy
             }
         return result
 
-    # ── FX Rates (no auth needed — frankfurter.app is free) ──────────────
+    # ── FX Rates (no auth — frankfurter.app / open.er-api.com) ───────────
     async def fetch_fx_rates(self) -> bool:
         urls = [
             "https://api.frankfurter.app/latest?base=USD",
             "https://open.er-api.com/v6/latest/USD",
         ]
+        last_exc: Optional[Exception] = None
+        last_code: Optional[int] = None
         for url in urls:
             try:
                 r = await self.client.get(url)
+                last_code = r.status_code
                 r.raise_for_status()
                 data  = r.json()
                 rates = data.get("rates") or data.get("conversion_rates", {})
                 if not rates:
-                    continue
+                    raise ValueError("Empty rates object in response")
                 new_rates: Dict[str, float] = {}
-                pairs = [
-                    "AUDJPY","NZDJPY","USDJPY","EURUSD","GBPUSD",
-                    "AUDUSD","EURGBP","USDCAD","EURAUD","GBPJPY",
-                    "AUDNZD","EURJPY","CADJPY","CHFJPY","EURCHF",
-                ]
-                for pair in pairs:
+                for pair in PAIRS_DEFAULT:
                     b, q = pair[:3], pair[3:]
                     rb = 1.0 if b == "USD" else rates.get(b)
                     rq = 1.0 if q == "USD" else rates.get(q)
                     if rb and rq:
                         new_rates[pair] = round(rq / rb, 5)
-                if new_rates:
-                    self.fx_rates = new_rates
-                    self.api_status["fx"]    = "ok"
-                    self.data_sources["fx"]  = "live"
-                    self.fetch_ts["fx"]      = time.time()
-                    return True
+                if not new_rates:
+                    raise ValueError("No valid pairs computed from rates")
+                self.fx_rates            = new_rates
+                self.api_status["fx"]    = "ok"
+                self.data_sources["fx"]  = "live"
+                self.fetch_ts["fx"]      = time.time()
+                self.api_errors.pop("fx", None)
+                return True
             except Exception as e:
-                logger.warning(f"[FX] {url}: {e}")
-        # Both failed — do NOT fall back to made-up rates
+                last_exc  = e
+                last_code = getattr(e, 'response', None) and e.response.status_code  # type: ignore
+        # Both URLs failed
         self.api_status["fx"]   = "error"
         self.data_sources["fx"] = "error"
+        if last_exc:
+            self._record_error("fx", last_exc, last_code)
         return False
 
     # ── FX History (for correlation matrix) ──────────────────────────────
@@ -166,12 +166,14 @@ class DataFetcher:
             r = await self.client.get(url)
             r.raise_for_status()
             data = r.json().get("rates", {})
-            if data:
-                self.fx_history = data
-                return True
+            if not data:
+                raise ValueError("Empty history response")
+            self.fx_history = data
+            return True
         except Exception as e:
-            logger.warning(f"[FX history] {e}")
-        return False
+            self._record_error("fx_history", e,
+                getattr(getattr(e, 'response', None), 'status_code', None))
+            return False
 
     # ── ECB Deposit Rate (free, no key) ──────────────────────────────────
     async def fetch_ecb_rate(self) -> bool:
@@ -184,25 +186,30 @@ class DataFetcher:
                    .get("series", {})
                    .get("0:0:0:0:0:0:0", {})
                    .get("observations", {}))
-            if obs:
-                latest_key = max(obs.keys(), key=int)
-                val = float(obs[latest_key][0])
-                if "EUR" not in self.cb_rates:
-                    self.cb_rates["EUR"] = val
-                else:
-                    self.cb_rates["EUR"] = val
-                if "EUR" not in self.cb_meta:
-                    self.cb_meta["EUR"] = dict(CB_META_STATIC["EUR"])
-                self.cb_meta["EUR"]["rate"]   = val
-                self.cb_meta["EUR"]["stance"] = (
-                    "Hawkish" if val > 2.5 else "Dovish" if val < 1.5 else "Neutral"
-                )
-                self.data_sources["cb_rates"] = "live"
-                self.fetch_ts["cb_rates"]      = time.time()
-                return True
+            if not obs:
+                raise ValueError("ECB: empty observations")
+            latest_key = max(obs.keys(), key=int)
+            val = float(obs[latest_key][0])
+            self.cb_rates["EUR"] = val
+            if "EUR" not in self.cb_meta:
+                self.cb_meta["EUR"] = {}
+            self.cb_meta["EUR"].update({
+                "bank":   "ECB",
+                "rate":   val,
+                "stance": "Hawkish" if val > 2.5 else "Dovish" if val < 1.5 else "Neutral",
+                "next":   "—",
+                "change": 0,
+            })
+            self.api_status["ecb"]       = "ok"
+            self.data_sources["cb_rates"] = "live"
+            self.fetch_ts["cb_rates"]     = time.time()
+            self.api_errors.pop("cb_rates", None)
+            return True
         except Exception as e:
-            logger.warning(f"[ECB] {e}")
-        return False
+            self.api_status["ecb"] = "error"
+            self._record_error("cb_rates", e,
+                getattr(getattr(e, 'response', None), 'status_code', None))
+            return False
 
     # ── World Bank GDP (free, no key) ─────────────────────────────────────
     async def fetch_gdp(self) -> bool:
@@ -211,6 +218,7 @@ class DataFetcher:
             "AUD": "AUS", "NZD": "NZL", "CAD": "CAN", "CHF": "CHE",
         }
         ok = False
+        errors: list = []
 
         async def _fetch_one(cur: str, iso: str):
             nonlocal ok
@@ -219,29 +227,47 @@ class DataFetcher:
             try:
                 r = await self.client.get(url)
                 r.raise_for_status()
-                obs = [x for x in (r.json()[1] or []) if x.get("value") is not None]
-                if obs:
-                    self.gdp_vals[cur] = round(obs[0]["value"], 2)
-                    ok = True
+                payload = r.json()
+                if not payload or len(payload) < 2:
+                    raise ValueError(f"WB GDP {cur}: malformed response")
+                obs = [x for x in (payload[1] or []) if x.get("value") is not None]
+                if not obs:
+                    raise ValueError(f"WB GDP {cur}: no valid observations")
+                self.gdp_vals[cur] = round(obs[0]["value"], 2)
+                ok = True
             except Exception as e:
-                logger.warning(f"[WB GDP {cur}] {e}")
+                code = getattr(getattr(e, 'response', None), 'status_code', None)
+                errors.append(f"{cur}:{code or str(e)[:40]}")
 
         await asyncio.gather(*[_fetch_one(c, i) for c, i in wb_map.items()])
         if ok:
-            self.api_status["worldbank"]  = "ok"
-            self.data_sources["gdp"]      = "live"
-            self.fetch_ts["gdp"]          = time.time()
+            self.api_status["worldbank"] = "ok"
+            self.data_sources["gdp"]     = "live"
+            self.fetch_ts["gdp"]         = time.time()
+            self.api_errors.pop("gdp", None)
         else:
-            self.api_status["worldbank"]  = "error"
-            self.data_sources["gdp"]      = self.data_sources.get("gdp") or "error"
+            self.api_status["worldbank"] = "error"
+            self.data_sources["gdp"]     = "error"
+            self.api_errors["gdp"] = {
+                "error":      "All World Bank GDP requests failed: " + ", ".join(errors),
+                "error_type": "HTTP_ERROR" if errors else "NETWORK",
+                "http_code":  None,
+                "ts":         int(time.time()),
+            }
         return ok
 
-    # ── FRED (requires key) ───────────────────────────────────────────────
+    # ── FRED (requires user API key) ──────────────────────────────────────
     async def fetch_fred(self) -> bool:
         key = self.cfg.get("fred_api_key", "").strip()
         if not key:
-            self.api_status["fred"] = "no_key"
+            self.api_status["fred"]  = "no_key"
             self.data_sources["cpi"] = "no_key"
+            self.api_errors["cpi"] = {
+                "error":      "No FRED API key configured",
+                "error_type": "NO_KEY",
+                "http_code":  None,
+                "ts":         int(time.time()),
+            }
             return False
         base = "https://api.stlouisfed.org/fred/series/observations"
 
@@ -250,17 +276,22 @@ class DataFetcher:
                    f"&file_type=json&limit=3&sort_order=desc")
             try:
                 r = await self.client.get(url)
+                if r.status_code == 429:
+                    raise httpx.HTTPStatusError("FRED rate limit", request=r.request, response=r)
                 r.raise_for_status()
                 obs = [o for o in r.json().get("observations", []) if o["value"] != "."]
-                return {"cur": float(obs[0]["value"]), "prev": float(obs[1]["value"])} if len(obs) >= 2 else None
+                if len(obs) < 2:
+                    raise ValueError(f"FRED {series_id}: insufficient observations ({len(obs)})")
+                return {"cur": float(obs[0]["value"]), "prev": float(obs[1]["value"])}
             except Exception as e:
-                logger.warning(f"[FRED {series_id}] {e}")
+                code = getattr(getattr(e, 'response', None), 'status_code', None)
+                self._record_error(f"fred_{series_id}", e, code)
                 return None
 
         tasks_def = [
-            ("CPIAUCSL",          "usd_cpi"),
-            ("FEDFUNDS",          "fed_funds"),
-            ("A191RL1Q225SBEA",   "usd_gdp"),
+            ("CPIAUCSL",        "usd_cpi"),
+            ("FEDFUNDS",         "fed_funds"),
+            ("A191RL1Q225SBEA",  "usd_gdp"),
         ]
         results = await asyncio.gather(*[_series(s) for s, _ in tasks_def])
         ok = False
@@ -270,13 +301,21 @@ class DataFetcher:
             ok = True
             change = res["cur"] - res["prev"]
             if key_name == "usd_cpi":
-                self.cpi_changes["USD"] = round(change, 3)
+                self.cpi_changes["USD"]   = round(change, 3)
                 self.data_sources["cpi"] = "live"
                 self.fetch_ts["cpi"]     = time.time()
+                self.api_errors.pop("cpi", None)
             elif key_name == "fed_funds":
                 self.cb_rates["USD"] = round(res["cur"], 3)
                 if "USD" not in self.cb_meta:
-                    self.cb_meta["USD"] = dict(CB_META_STATIC["USD"])
+                    self.cb_meta["USD"] = {}
+                self.cb_meta["USD"].update({
+                    "bank":   "Federal Reserve",
+                    "rate":   round(res["cur"], 3),
+                    "stance": "Hawkish" if res["cur"] > 4 else "Dovish" if res["cur"] < 2 else "Neutral",
+                    "next":   "—",
+                    "change": round(change, 3),
+                })
                 self.data_sources["cb_rates"] = "live"
                 self.fetch_ts["cb_rates"]      = time.time()
             elif key_name == "usd_gdp":
@@ -284,14 +323,27 @@ class DataFetcher:
                 self.data_sources["gdp"] = "live"
 
         self.api_status["fred"] = "ok" if ok else "error"
+        if not ok:
+            self.api_errors["cpi"] = {
+                "error":      "FRED returned no usable data (check key validity)",
+                "error_type": "HTTP_ERROR",
+                "http_code":  None,
+                "ts":         int(time.time()),
+            }
         return ok
 
     # ── News sentiment (requires NewsAPI key) ─────────────────────────────
     async def fetch_news_sentiment(self) -> bool:
         key = self.cfg.get("news_api_key", "").strip()
         if not key:
-            self.api_status["news"]    = "no_key"
-            self.data_sources["news"]  = "no_key"
+            self.api_status["news"]   = "no_key"
+            self.data_sources["news"] = "no_key"
+            self.api_errors["news"] = {
+                "error":      "No NewsAPI key configured",
+                "error_type": "NO_KEY",
+                "http_code":  None,
+                "ts":         int(time.time()),
+            }
             return False
         queries = {
             "USD": "US dollar Federal Reserve interest rates",
@@ -306,14 +358,19 @@ class DataFetcher:
         POS = {"surge","rise","strong","growth","beat","bullish","hawkish","gain","high","positive","increase","expand","rally","jump"}
         NEG = {"fall","drop","weak","recession","miss","bearish","dovish","loss","cut","decline","contract","concern","slump","slide"}
         ok = False
+        any_error: Optional[str] = None
         for cur, q in queries.items():
             url = (f"https://newsapi.org/v2/everything?q={q}"
                    f"&language=en&pageSize=10&sortBy=publishedAt&apiKey={key}")
             try:
                 r = await self.client.get(url)
+                if r.status_code == 429:
+                    any_error = "NewsAPI rate limit reached"
+                    break
                 r.raise_for_status()
                 data = r.json()
                 if data.get("status") != "ok":
+                    any_error = data.get("message", "NewsAPI error")
                     continue
                 score = 0
                 for art in data.get("articles", []):
@@ -326,26 +383,44 @@ class DataFetcher:
                 ok = True
                 await asyncio.sleep(0.15)
             except Exception as e:
-                logger.warning(f"[NEWS {cur}] {e}")
+                code = getattr(getattr(e, 'response', None), 'status_code', None)
+                any_error = f"{type(e).__name__}: {str(e)[:80]}"
+                logger.warning("[NEWS %s] %s", cur, any_error)
         if ok:
-            self.api_status["news"]    = "ok"
-            self.data_sources["news"]  = "live"
-            self.fetch_ts["news"]      = time.time()
+            self.api_status["news"]   = "ok"
+            self.data_sources["news"] = "live"
+            self.fetch_ts["news"]     = time.time()
+            self.api_errors.pop("news", None)
         else:
-            self.api_status["news"]    = "error"
-            self.data_sources["news"]  = "error"
+            self.api_status["news"]   = "error"
+            self.data_sources["news"] = "error"
+            self.api_errors["news"] = {
+                "error":      any_error or "NewsAPI: all requests failed",
+                "error_type": "RATE_LIMIT" if any_error and "rate limit" in (any_error or "").lower() else "HTTP_ERROR",
+                "http_code":  None,
+                "ts":         int(time.time()),
+            }
         return ok
 
-    # ── Alpha Vantage trend (requires AV key) ─────────────────────────────
+    # ── Alpha Vantage FX trend (requires AV key) ──────────────────────────
     async def fetch_av_trends(self, trend_overrides: dict) -> bool:
         key = self.cfg.get("alpha_vantage_key", "").strip()
         if not key:
-            self.api_status["av"]    = "no_key"
+            self.api_status["av"]   = "no_key"
             self.data_sources["av"] = "no_key"
+            self.api_errors["av"] = {
+                "error":      "No Alpha Vantage API key configured",
+                "error_type": "NO_KEY",
+                "http_code":  None,
+                "ts":         int(time.time()),
+            }
             return False
         targets = ["EUR","GBP","JPY","AUD","NZD","CAD","CHF"]
         ok = False
+        rate_limited = False
         for cur in targets:
+            if rate_limited:
+                break
             url = (f"https://www.alphavantage.co/query?function=FX_WEEKLY"
                    f"&from_symbol={cur}&to_symbol=USD&apikey={key}")
             try:
@@ -353,14 +428,20 @@ class DataFetcher:
                 r.raise_for_status()
                 data = r.json()
                 if "Note" in data or "Information" in data:
-                    logger.warning("[AV] Rate limit hit")
+                    rate_limited = True
+                    self.api_errors["av"] = {
+                        "error":      data.get("Note") or data.get("Information", "AV rate limit"),
+                        "error_type": "RATE_LIMIT",
+                        "http_code":  None,
+                        "ts":         int(time.time()),
+                    }
                     break
                 series = data.get("Weekly Time Series Forex (FX)", {})
                 if not series:
-                    continue
+                    raise ValueError(f"AV {cur}: no series data in response")
                 dates  = sorted(series.keys(), reverse=True)
                 if len(dates) < 20:
-                    continue
+                    raise ValueError(f"AV {cur}: only {len(dates)} weekly bars, need 20")
                 price  = float(series[dates[0]]["4. close"])
                 ma8    = sum(float(series[d]["4. close"]) for d in dates[:8])  / 8
                 ma20   = sum(float(series[d]["4. close"]) for d in dates[:20]) / 20
@@ -370,19 +451,29 @@ class DataFetcher:
                    -2 if price < ma8 < ma20  else -1
                 )
                 ok = True
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(1.2)  # AV free tier: 5 calls/min
             except Exception as e:
-                logger.warning(f"[AV {cur}] {e}")
+                code = getattr(getattr(e, 'response', None), 'status_code', None)
+                logger.warning("[AV %s] %s", cur, e)
         if ok:
-            self.api_status["av"]    = "ok"
+            self.api_status["av"]   = "ok"
             self.data_sources["av"] = "live"
             self.fetch_ts["av"]     = time.time()
-        else:
-            self.api_status["av"]    = "error"
+            if not rate_limited:
+                self.api_errors.pop("av", None)
+        elif not rate_limited:
+            self.api_status["av"]   = "error"
             self.data_sources["av"] = "error"
+            if "av" not in self.api_errors:
+                self.api_errors["av"] = {
+                    "error":      "Alpha Vantage: all currency requests failed",
+                    "error_type": "HTTP_ERROR",
+                    "http_code":  None,
+                    "ts":         int(time.time()),
+                }
         return ok
 
-    # ── Correlation matrix ────────────────────────────────────────────────
+    # ── Correlation matrix (computed from fx_history cache) ───────────────
     def compute_correlation_matrix(self) -> Dict[str, Dict[str, float]]:
         import math
         curs  = ["USD","EUR","GBP","JPY","AUD","NZD","CAD","CHF"]
