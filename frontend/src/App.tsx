@@ -10,17 +10,20 @@ import ConfigView from './components/views/ConfigView'
 import AboutView from './components/views/AboutView'
 import { useMacroWS } from './hooks/useMacroWS'
 import { useApi } from './hooks/useApi'
+import { emptyState } from './types'
 import s from './App.module.css'
 
 export type ViewId = 'heatmap' | 'signals' | 'macro' | 'backtest' | 'config' | 'about'
 
 export default function App() {
   const [activeView, setActiveView] = useState<ViewId>('heatmap')
-  const { state, connected } = useMacroWS()
+  const { state: wsState, connected, wsError } = useMacroWS()
   const { saveConfig, triggerRefresh } = useApi('http://127.0.0.1:8766')
 
-  const cfg       = state?.config     ?? {}
-  const apiStatus = state?.api_status ?? {}
+  // Use emptyState() as fallback so all views always get a non-null state
+  const state = wsState ?? emptyState()
+  const cfg        = state.config     ?? {}
+  const apiStatus  = state.api_status ?? {}
 
   return (
     <div className={s.root}>
@@ -31,12 +34,12 @@ export default function App() {
           {activeView === 'heatmap'  && <HeatmapView  state={state} />}
           {activeView === 'signals'  && <SignalsView  state={state} />}
           {activeView === 'macro'    && <MacroView    state={state} />}
-          {activeView === 'backtest' && <BacktestView state={state} activePairs={cfg.active_pairs ?? []} />}
+          {activeView === 'backtest' && <BacktestView state={state} activePairs={(cfg as any).active_pairs ?? []} />}
           {activeView === 'config'   && <ConfigView   config={cfg} apiStatus={apiStatus} onSave={saveConfig} />}
           {activeView === 'about'    && <AboutView    apiStatus={apiStatus} />}
         </main>
       </div>
-      <StatusBar state={state} connected={connected} />
+      <StatusBar state={state} connected={connected} wsError={wsError} />
     </div>
   )
 }
